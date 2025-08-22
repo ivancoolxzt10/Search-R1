@@ -1,20 +1,21 @@
-import json
-import os
-import warnings
-from typing import List, Dict, Optional
-import argparse
+import json  # JSON处理库
+import os  # 操作系统相关库
+import warnings  # 警告处理库
+from typing import List, Dict, Optional  # 类型注解
+import argparse  # 命令行参数解析库
 
-import faiss
-import torch
-import numpy as np
-from transformers import AutoConfig, AutoTokenizer, AutoModel
-from tqdm import tqdm
-import datasets
+import faiss  # 向量检索库
+import torch  # PyTorch深度学习库
+import numpy as np  # 数值计算库
+from transformers import AutoConfig, AutoTokenizer, AutoModel  # Transformers库
+from tqdm import tqdm  # 进度条库
+import datasets  # HuggingFace数据集库
 
-import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
+import uvicorn  # ASGI服务器
+from fastapi import FastAPI  # Web框架
+from pydantic import BaseModel  # 数据模型校验
 
+# 功能说明：加载语料库，支持jsonl格式并多进程加速。
 def load_corpus(corpus_path: str):
     corpus = datasets.load_dataset(
         'json', 
@@ -24,6 +25,7 @@ def load_corpus(corpus_path: str):
     )
     return corpus
 
+# 功能说明：读取jsonl文件，返回数据列表。
 def read_jsonl(file_path):
     data = []
     with open(file_path, "r") as f:
@@ -31,10 +33,12 @@ def read_jsonl(file_path):
             data.append(json.loads(line))
     return data
 
+# 功能说明：根据文档索引列表从语料库加载文档。
 def load_docs(corpus, doc_idxs):
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
 
+# 功能说明：加载检索模型和分词器，支持FP16。
 def load_model(model_path: str, use_fp16: bool = False):
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
@@ -45,6 +49,7 @@ def load_model(model_path: str, use_fp16: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
     return model, tokenizer
 
+# 功能说明：池化方法，支持mean、cls、pooler。
 def pooling(
     pooler_output,
     last_hidden_state,
@@ -61,6 +66,7 @@ def pooling(
     else:
         raise NotImplementedError("Pooling method not implemented!")
 
+# 功能说明：Encoder类用于文本编码为向量，支持多种检索模型。
 class Encoder:
     def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
         self.model_name = model_name
@@ -74,7 +80,7 @@ class Encoder:
 
     @torch.no_grad()
     def encode(self, query_list: List[str], is_query=True) -> np.ndarray:
-        # processing query for different encoders
+        # 处理不同模型的输入前缀
         if isinstance(query_list, str):
             query_list = [query_list]
 
@@ -122,6 +128,7 @@ class Encoder:
 
         return query_emb
 
+# BaseRetriever类：检索器基类，定义通用接口。
 class BaseRetriever:
     def __init__(self, config):
         self.config = config
@@ -143,6 +150,7 @@ class BaseRetriever:
     def batch_search(self, query_list: List[str], num: int = None, return_score: bool = False):
         return self._batch_search(query_list, num, return_score)
 
+# BM25Retriever类：基于Pyserini的BM25检索器，支持批量检索和分数返回。
 class BM25Retriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
@@ -204,6 +212,7 @@ class BM25Retriever(BaseRetriever):
         else:
             return results
 
+# DenseRetriever类：基于Faiss的稠密检索器，支持GPU加速、批量检索和分数返回。
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
@@ -270,6 +279,7 @@ class DenseRetriever(BaseRetriever):
         else:
             return results
 
+# get_retriever函数：根据配置自动选择检索器类型。
 def get_retriever(config):
     if config.retrieval_method == "bm25":
         return BM25Retriever(config)
@@ -326,8 +336,8 @@ app = FastAPI()
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
     """
-    Endpoint that accepts queries and performs retrieval.
-    Input format:
+    FastAPI接口：批量检索。
+    输入格式：
     {
       "queries": ["What is Python?", "Tell me about neural networks."],
       "topk": 3,
@@ -335,20 +345,20 @@ def retrieve_endpoint(request: QueryRequest):
     }
     """
     if not request.topk:
-        request.topk = config.retrieval_topk  # fallback to default
+        request.topk = config.retrieval_topk  # 默认topk
 
-    # Perform batch retrieval
+    # 批量检索
     results, scores = retriever.batch_search(
         query_list=request.queries,
         num=request.topk,
         return_score=request.return_scores
     )
     
-    # Format response
+    # 格式化返回结果
     resp = []
     for i, single_result in enumerate(results):
         if request.return_scores:
-            # If scores are returned, combine them with results
+            # 如果返回分数，合并结果和分数
             combined = []
             for doc, score in zip(single_result, scores[i]):
                 combined.append({"document": doc, "score": score})
@@ -390,3 +400,6 @@ if __name__ == "__main__":
     
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# 文件整体功能总结：
+# retrieval_server.py 实现了通用检索服务，支持BM25和稠密检索，批量查询、分数返回、接口集成，便于RAG、问答等场景的高效部署。

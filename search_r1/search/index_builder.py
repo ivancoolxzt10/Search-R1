@@ -1,19 +1,20 @@
-import os
-import faiss
-import json
-import warnings
-import numpy as np
-from typing import cast, List, Dict
-import shutil
-import subprocess
-import argparse
-import torch
-from tqdm import tqdm
+import os  # 操作系统相关库
+import faiss  # 向量检索库
+import json  # JSON处理库
+import warnings  # 警告处理库
+import numpy as np  # 数值计算库
+from typing import cast, List, Dict  # 类型注解
+import shutil  # 文件操作库
+import subprocess  # 子进程管理库
+import argparse  # 命令行参数解析库
+import torch  # PyTorch深度学习库
+from tqdm import tqdm  # 进度条库
 # from LongRAG.retriever.utils import load_model, load_corpus, pooling
-import datasets
-from transformers import AutoTokenizer, AutoModel, AutoConfig
+import datasets  # HuggingFace数据集库
+from transformers import AutoTokenizer, AutoModel, AutoConfig  # Transformers库
 
 
+# 功能说明：加载预训练模型和分词器。
 def load_model(
         model_path: str, 
         use_fp16: bool = False
@@ -29,6 +30,7 @@ def load_model(
     return model, tokenizer
 
 
+# 功能说明：根据指定方法对模型输出进行池化，得到句向量。
 def pooling(
         pooler_output,
         last_hidden_state,
@@ -46,6 +48,7 @@ def pooling(
         raise NotImplementedError("Pooling method not implemented!")
 
 
+# 功能说明：加载语料库。
 def load_corpus(corpus_path: str):
     corpus = datasets.load_dataset(
             'json', 
@@ -55,9 +58,10 @@ def load_corpus(corpus_path: str):
     return corpus
 
 
+# 功能说明：索引构建主类，支持BM25和Dense索引。
 class Index_Builder:
     r"""A tool class used to build an index used in retrieval.
-    
+    检索索引构建工具类，支持稠密向量和BM25索引。
     """
     def __init__(
             self, 
@@ -74,7 +78,7 @@ class Index_Builder:
             save_embedding=False,
             faiss_gpu=False
         ):
-        
+        # 初始化参数
         self.retrieval_method = retrieval_method.lower()
         self.model_path = model_path
         self.corpus_path = corpus_path
@@ -88,8 +92,8 @@ class Index_Builder:
         self.save_embedding = save_embedding
         self.faiss_gpu = faiss_gpu
 
-        self.gpu_num = torch.cuda.device_count()
-        # prepare save dir
+        self.gpu_num = torch.cuda.device_count()  # GPU数量
+        # 准备保存目录
         print(self.save_dir)
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
@@ -101,15 +105,13 @@ class Index_Builder:
 
         self.embedding_save_path = os.path.join(self.save_dir, f"emb_{self.retrieval_method}.memmap")
 
-        self.corpus = load_corpus(self.corpus_path)
-       
+        self.corpus = load_corpus(self.corpus_path)  # 加载语料库
+
         print("Finish loading...")
+
     @staticmethod
     def _check_dir(dir_path):
-        r"""Check if the dir path exists and if there is content.
-        
-        """
-        
+        r"""检查目录是否存在且为空。"""
         if os.path.isdir(dir_path):
             if len(os.listdir(dir_path)) > 0:
                 return False
@@ -118,33 +120,22 @@ class Index_Builder:
         return True
 
     def build_index(self):
-        r"""Constructing different indexes based on selective retrieval method.
-
-        """
+        r"""根据检索方法构建索引。"""
         if self.retrieval_method == "bm25":
             self.build_bm25_index()
         else:
             self.build_dense_index()
 
     def build_bm25_index(self):
-        """Building BM25 index based on Pyserini library.
+        """基于Pyserini库构建BM25索引。"""
 
-        Reference: https://github.com/castorini/pyserini/blob/master/docs/usage-index.md#building-a-bm25-index-direct-java-implementation
-        """
-
-        # to use pyserini pipeline, we first need to place jsonl file in the folder 
+        # 将jsonl文件放入指定文件夹
         self.save_dir = os.path.join(self.save_dir, "bm25")
         os.makedirs(self.save_dir, exist_ok=True)
         temp_dir = self.save_dir + "/temp"
         temp_file_path = temp_dir + "/temp.jsonl"
         os.makedirs(temp_dir)
 
-        # if self.have_contents:
-        #     shutil.copyfile(self.corpus_path, temp_file_path)
-        # else:
-        #     with open(temp_file_path, "w") as f:
-        #         for item in self.corpus:
-        #             f.write(json.dumps(item) + "\n")
         shutil.copyfile(self.corpus_path, temp_file_path)
         
         print("Start building bm25 index...")
@@ -161,6 +152,7 @@ class Index_Builder:
         print("Finish!")
 
     def _load_embedding(self, embedding_path, corpus_size, hidden_size):
+        """加载memmap格式的embedding。"""
         all_embeddings = np.memmap(
                 embedding_path,
                 mode="r",
@@ -169,6 +161,7 @@ class Index_Builder:
         return all_embeddings
 
     def _save_embedding(self, all_embeddings):
+        """保存embedding到memmap文件。"""
         memmap = np.memmap(
             self.embedding_save_path,
             shape=all_embeddings.shape,
@@ -186,6 +179,7 @@ class Index_Builder:
             memmap[:] = all_embeddings
 
     def encode_all(self):
+        """批量编码所有语料，得到embedding。"""
         if self.gpu_num > 1:
             print("Use multi gpu!")
             self.encoder = torch.nn.DataParallel(self.encoder)
@@ -213,7 +207,7 @@ class Index_Builder:
 
             inputs = {k: v.cuda() for k, v in inputs.items()}
 
-            #TODO: support encoder-only T5 model
+            #TODO: 支持encoder-only T5模型
             if "T5" in type(self.encoder).__name__:
                 # T5-based retrieval model
                 decoder_input_ids = torch.zeros(
@@ -244,10 +238,8 @@ class Index_Builder:
 
     @torch.no_grad()
     def build_dense_index(self):
-        """Obtain the representation of documents based on the embedding model(BERT-based) and 
-        construct a faiss index.
-        """
-        
+        """基于BERT等embedding模型构建faiss稠密索引。"""
+
         if os.path.exists(self.index_save_path):
             print("The index file already exists and will be overwritten.")
         
@@ -294,27 +286,29 @@ MODEL2POOLING = {
 }
 
 
+# 主流程入口，负责参数解析、索引构建。
 def main():
     parser = argparse.ArgumentParser(description = "Creating index.")
 
-    # Basic parameters
-    parser.add_argument('--retrieval_method', type=str)
-    parser.add_argument('--model_path', type=str, default=None)
-    parser.add_argument('--corpus_path', type=str)
-    parser.add_argument('--save_dir', default= 'indexes/',type=str)
+    # 基本参数
+    parser.add_argument('--retrieval_method', type=str, help='检索方法（如e5、bm25等）')
+    parser.add_argument('--model_path', type=str, default=None, help='模型路径')
+    parser.add_argument('--corpus_path', type=str, help='语料库路径')
+    parser.add_argument('--save_dir', default= 'indexes/',type=str, help='索引保存目录')
 
-    # Parameters for building dense index
-    parser.add_argument('--max_length', type=int, default=180)
-    parser.add_argument('--batch_size', type=int, default=512)
-    parser.add_argument('--use_fp16', default=False, action='store_true')
-    parser.add_argument('--pooling_method', type=str, default=None)
-    parser.add_argument('--faiss_type',default=None,type=str)
-    parser.add_argument('--embedding_path', default=None, type=str)
-    parser.add_argument('--save_embedding', action='store_true', default=False)
-    parser.add_argument('--faiss_gpu', default=False, action='store_true')
-    
+    # Dense索引参数
+    parser.add_argument('--max_length', type=int, default=180, help='最大输入长度')
+    parser.add_argument('--batch_size', type=int, default=512, help='批处理大小')
+    parser.add_argument('--use_fp16', default=False, action='store_true', help='是否使用FP16')
+    parser.add_argument('--pooling_method', type=str, default=None, help='池化方法')
+    parser.add_argument('--faiss_type',default=None,type=str, help='faiss索引类型')
+    parser.add_argument('--embedding_path', default=None, type=str, help='embedding文件路径')
+    parser.add_argument('--save_embedding', action='store_true', default=False, help='是否保存embedding')
+    parser.add_argument('--faiss_gpu', default=False, action='store_true', help='是否使用GPU加速faiss')
+
     args = parser.parse_args()
 
+    # 自动推断池化方法
     if args.pooling_method is None:
         pooling_method = 'mean'
         for k,v in MODEL2POOLING.items():
@@ -327,7 +321,7 @@ def main():
         else:
             pooling_method = args.pooling_method
 
-
+    # 构建索引
     index_builder = Index_Builder(
                         retrieval_method = args.retrieval_method,
                         model_path = args.model_path,

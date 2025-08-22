@@ -2,7 +2,6 @@ accelerate
 codetiming
 datasets
 dill
-flash-attn
 hydra-core
 numpy
 pandas

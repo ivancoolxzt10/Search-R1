@@ -1,18 +1,18 @@
-import argparse
-from collections import defaultdict
-from typing import Optional
-from dataclasses import dataclass, field
+import argparse  # 命令行参数解析库
+from collections import defaultdict  # 默认字典容器
+from typing import Optional  # 类型注解
+from dataclasses import dataclass, field  # 数据类工具
 
-from sentence_transformers import CrossEncoder
-import torch
-from transformers import HfArgumentParser
-import numpy as np
+from sentence_transformers import CrossEncoder  # 句子交叉编码器
+import torch  # PyTorch深度学习库
+from transformers import HfArgumentParser  # HuggingFace参数解析器
+import numpy as np  # 数值计算库
 
-import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
+import uvicorn  # ASGI服务器
+from fastapi import FastAPI  # Web框架
+from pydantic import BaseModel  # 数据模型校验
 
-
+# 基础交叉编码器类，支持批量重排序。
 class BaseCrossEncoder:
     def __init__(self, model, batch_size=32, device="cuda"):
         self.model = model
@@ -20,6 +20,9 @@ class BaseCrossEncoder:
         self.model.to(device)
 
     def _passage_to_string(self, doc_item):
+        """
+        将文档字典转为字符串，格式：(Title: 标题) 正文
+        """
         if "document" not in doc_item:
             content = doc_item['contents']
         else:
@@ -33,9 +36,11 @@ class BaseCrossEncoder:
                queries: list[str], 
                documents: list[list[dict]]):
         """
-        Assume documents is a list of list of dicts, where each dict is a document with keys "id" and "contents".
-        This asumption is made to be consistent with the output of the retrieval server.
-        """ 
+        批量重排序接口。
+        queries: 查询列表
+        documents: 每个查询对应的文档列表（嵌套字典）
+        返回：每个查询对应的文档及分数，按分数降序排列
+        """
         assert len(queries) == len(documents)
 
         pairs = []
@@ -64,28 +69,42 @@ class BaseCrossEncoder:
         return sorted_query_to_doc_scores
 
     def _predict(self, pairs: list[tuple[str, str]]):
-        raise NotImplementedError 
+        """
+        预测分数，需子类实现。
+        """
+        raise NotImplementedError
 
     @classmethod
     def load(cls, model_name_or_path, **kwargs):
+        """
+        加载模型，需子类实现。
+        """
         raise NotImplementedError
 
 
+# SentenceTransformer交叉编码器实现
 class SentenceTransformerCrossEncoder(BaseCrossEncoder):
     def __init__(self, model, batch_size=32, device="cuda"):
         super().__init__(model, batch_size, device)
 
     def _predict(self, pairs: list[tuple[str, str]]):
+        """
+        使用CrossEncoder模型预测分数。
+        """
         scores = self.model.predict(pairs, batch_size=self.batch_size)
         scores = scores.tolist() if isinstance(scores, torch.Tensor) or isinstance(scores, np.ndarray) else scores
         return scores
 
     @classmethod
     def load(cls, model_name_or_path, **kwargs):
+        """
+        加载CrossEncoder模型。
+        """
         model = CrossEncoder(model_name_or_path)
         return cls(model, **kwargs)
 
 
+# FastAPI请求体定义
 class RerankRequest(BaseModel):
     queries: list[str]
     documents: list[list[dict]]
@@ -93,7 +112,8 @@ class RerankRequest(BaseModel):
     return_scores: bool = False
 
 
-@dataclass 
+# 重排序参数数据类
+@dataclass
 class RerankerArguments:
     max_length: int = field(default=512)
     rerank_topk: int = field(default=3)
@@ -101,6 +121,8 @@ class RerankerArguments:
     batch_size: int = field(default=32)
     reranker_type: str = field(default="sentence_transformer")
 
+
+# 获取重排序器实例
 def get_reranker(config):
     if config.reranker_type == "sentence_transformer":
         return SentenceTransformerCrossEncoder.load(
@@ -117,8 +139,8 @@ app = FastAPI()
 @app.post("/rerank")
 def rerank_endpoint(request: RerankRequest):
     """
-    Endpoint that accepts queries and performs retrieval.
-    Input format:
+    FastAPI接口：批量重排序。
+    输入格式：
     {
       "queries": ["What is Python?", "Tell me about neural networks."],
       "documents": [[doc_item_1, ..., doc_item_k], [doc_item_1, ..., doc_item_k]],
@@ -127,13 +149,12 @@ def rerank_endpoint(request: RerankRequest):
     }
     """
     if not request.rerank_topk:
-        request.rerank_topk = config.rerank_topk  # fallback to default
+        request.rerank_topk = config.rerank_topk  # 默认topk
 
-    # Perform batch re reranking
-    # doc_scores already sorted by score
-    query_to_doc_scores = reranker.rerank(request.queries, request.documents) 
+    # 批量重排序
+    query_to_doc_scores = reranker.rerank(request.queries, request.documents)
 
-    # Format response 
+    # 格式化返回结果
     resp = []
     for _, doc_scores in query_to_doc_scores.items():
         doc_scores = doc_scores[:request.rerank_topk]
@@ -148,14 +169,12 @@ def rerank_endpoint(request: RerankRequest):
 
 
 if __name__ == "__main__":
-    
-    # 1) Build a config (could also parse from arguments).
-    #    In real usage, you'd parse your CLI arguments or environment variables.
+    # 1) 构建配置（可通过命令行参数或环境变量解析）。
     parser = HfArgumentParser((RerankerArguments))
     config = parser.parse_args_into_dataclasses()[0]
 
-    # 2) Instantiate a global retriever so it is loaded once and reused.
+    # 2) 实例化全局重排序器，避免重复加载
     reranker = get_reranker(config)
     
-    # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
+    # 3) 启动服务，默认监听 http://0.0.0.0:6980
     uvicorn.run(app, host="0.0.0.0", port=6980)

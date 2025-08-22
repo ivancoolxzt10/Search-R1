@@ -1,17 +1,29 @@
-import torch
-import re
-from collections import defaultdict
-import os
-from typing import List, Dict, Any, Tuple
-from dataclasses import dataclass
-from .tensor_helper import TensorHelper, TensorConfig
-from verl import DataProto
-from verl.utils.tracking import Tracking
-import shutil
-import requests
+import torch  # PyTorch深度学习库
+import re  # 正则表达式库
+from collections import defaultdict  # 默认字典容器
+import os  # 操作系统相关库
+from typing import List, Dict, Any, Tuple  # 类型注解
+from dataclasses import dataclass  # 数据类装饰器
+from .tensor_helper import TensorHelper, TensorConfig  # 张量辅助工具
+from verl import DataProto  # 数据协议类
+from verl.utils.tracking import Tracking  # 跟踪工具
+import shutil  # 文件操作工具
+import requests  # HTTP请求库
 
 @dataclass
 class GenerationConfig:
+    """
+    推理配置参数数据类。
+    max_turns: 最大推理轮数
+    max_start_length: 初始输入最大长度
+    max_prompt_length: 总输入最大长度
+    max_response_length: 单次响应最大长度
+    max_obs_length: 环境观察最大长度
+    num_gpus: 使用GPU数量
+    no_think_rl: 是否禁用推理环节
+    search_url: 搜索服务URL
+    topk: 搜索结果数量
+    """
     max_turns: int
     max_start_length: int
     max_prompt_length: int 
@@ -22,6 +34,7 @@ class GenerationConfig:
     search_url: str = None
     topk: int = 3
 
+# 功能说明：LLMGenerationManager类负责大模型推理主流程，包括批量分词、响应后处理、状态更新、环境交互、搜索等。
 class LLMGenerationManager:
     def __init__(
         self,
@@ -30,11 +43,18 @@ class LLMGenerationManager:
         config: GenerationConfig,
         is_validation: bool = False,
     ):
-        self.tokenizer = tokenizer
-        self.actor_rollout_wg = actor_rollout_wg
-        self.config = config
-        self.is_validation = is_validation
-
+        """
+        初始化推理管理器。
+        tokenizer: 分词器
+        actor_rollout_wg: 推理工作组
+        config: 推理配置
+        is_validation: 是否为验证模式
+        """
+        self.tokenizer = tokenizer  # 分词器
+        self.actor_rollout_wg = actor_rollout_wg  # 推理工作组
+        self.config = config  # 推理配置
+        self.is_validation = is_validation  # 是否为验证模式
+        # TensorHelper用于张量处理和padding
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
             max_prompt_length=config.max_prompt_length,
@@ -43,7 +63,11 @@ class LLMGenerationManager:
         ))
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
-        """Tokenize a batch of responses."""
+        """
+        批量分词，将字符串列表转为张量。
+        responses: 待分词的字符串列表
+        返回：分词后的input_ids张量
+        """
         return self.tokenizer(
             responses, 
             add_special_tokens=False, 
@@ -52,22 +76,25 @@ class LLMGenerationManager:
         )['input_ids']
 
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
-        """Process responses to stop at search operation or answer operation."""
+        """
+        后处理响应，遇到search或answer标签即截断。
+        responses: 响应张量
+        返回：截断后的分词张量和字符串列表
+        """
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
-
+        # 截断到</search>或</answer>标签
         responses_str = [resp.split('</search>')[0] + '</search>'
                  if '</search>' in resp 
                  else resp.split('</answer>')[0] + '</answer>'
                  if '</answer>' in resp 
                  else resp
                  for resp in responses_str]
-
         if self.config.no_think_rl:
             raise ValueError('stop')
-            # if no_think_rl is enabled, only keep action in the str
+            # no_think_rl模式下只保留动作
             actions, _ = self.env.postprocess_predictions(responses_str)
             responses_str=[f"<answer>{envs[idx].ACTION_LOOKUP[action]}</answer>" for idx, action in enumerate(actions)]
             print("RESPONSES:", responses_str)
@@ -75,46 +102,49 @@ class LLMGenerationManager:
         return responses, responses_str
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
-        """Process next observations from environment."""
-        
+        """
+        处理环境返回的下一步观察，转为张量。
+        next_obs: 观察字符串列表
+        返回：分词后的input_ids张量
+        """
         next_obs_ids = self.tokenizer(
             next_obs, 
             padding='longest',
             return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
+            add_special_tokens=False,  # 不加特殊token
         )['input_ids']
-
         if next_obs_ids.shape[1] > self.config.max_obs_length:
             print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
-
         return next_obs_ids
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
-        """Update rolling state with new responses and observations."""
-        # Concatenate and handle padding        
+        """
+        更新推理状态，拼接新响应和观察。
+        rollings: 当前推理状态
+        cur_responses: 当前响应张量
+        next_obs_ids: 下一步观察张量
+        返回：更新后的推理状态
+        """
+        # 拼接并处理padding
         new_input_ids = self.tensor_fn.concatenate_with_padding([
             rollings.batch['input_ids'],
             cur_responses,
             next_obs_ids
         ])
-        
-        # Create attention mask and position ids
+        # attention mask和position ids
         new_attention_mask = self.tensor_fn.create_attention_mask(new_input_ids)
         new_position_ids = self.tensor_fn.create_position_ids(new_attention_mask)
-
-        # Cut to appropriate length
+        # 截断到最大长度
         effective_len = new_attention_mask.sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
-
         new_rollings = DataProto.from_dict({
             'input_ids': new_input_ids[:, -max_len:],
             'position_ids': new_position_ids[:, -max_len:],
             'attention_mask': new_attention_mask[:, -max_len:]
         })
         new_rollings.meta_info.update(rollings.meta_info)
-        
         return new_rollings
 
     def _info_masked_concatenate_with_padding(self, 
@@ -124,54 +154,64 @@ class LLMGenerationManager:
                 info: torch.Tensor = None,
                 pad_to_left: bool = True
             ) -> torch.Tensor:
-        """Concatenate tensors and handle padding. Additionally, create a mask (info_mask) to cover the information block if it exists."""
+        """
+        拼接张量并处理信息mask。
+        prompt: 原始输入张量
+        prompt_with_mask: mask处理后的输入张量
+        response: 响应张量
+        info: 额外信息张量（如观察）
+        pad_to_left: 是否左侧padding
+        返回：拼接后的张量及mask张量
+        """
         pad_id = self.tokenizer.pad_token_id
         tensors = [prompt, response]
         tensors_with_mask = [prompt_with_mask, response]
         if info is not None:
             tensors.append(info)
-            info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
+            info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # 信息mask
             tensors_with_mask.append(info_mask)
-        
         concatenated = torch.cat(tensors, dim=1)
         concatenated_with_info = torch.cat(tensors_with_mask, dim=1)
         mask = concatenated != pad_id if pad_to_left else concatenated == pad_id
         sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
         padded_tensor = concatenated.gather(1, sorted_indices)
         padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
-
         return padded_tensor, padded_tensor_with_info
 
     def _update_right_side(self, right_side: Dict, 
                           cur_responses: torch.Tensor,
                           next_obs_ids: torch.Tensor = None) -> Dict:
-        """Update right side state."""
+        """
+        更新右侧状态。
+        right_side: 当前右侧状态字典
+        cur_responses: 当前响应张量
+        next_obs_ids: 下一步观察张量（可选）
+        返回：更新后的右侧状态字典
+        """
         if next_obs_ids != None:
             responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
-                    right_side['responses'],
-                    right_side['responses_with_info_mask'],
-                    cur_responses,
-                    next_obs_ids, 
-                    pad_to_left=False
-                )
+                right_side['responses'],
+                right_side['responses_with_info_mask'],
+                cur_responses,
+                next_obs_ids,
+                pad_to_left=False
+            )
         else:
             responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
-                    right_side['responses'],
-                    right_side['responses_with_info_mask'],
-                    cur_responses,
-                    pad_to_left=False
-                )
+                right_side['responses'],
+                right_side['responses_with_info_mask'],
+                cur_responses,
+                pad_to_left=False
+            )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
-        
         return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
-            Wrapper for generation that handles multi-GPU padding requirements.
-            if num_gpus <= 1, return self.actor_rollout_wg.generate_sequences(active_batch)
-            if active_batch size is not divisible by num_gpus, pad with first sequence
-            then remove padding from output
+        多GPU推理包装，自动补齐batch以适配GPU数量。
+        active_batch: 当前推理batch
+        返回：推理结果batch
         """
         num_gpus = self.config.num_gpus
         if num_gpus <= 1:
@@ -218,8 +258,12 @@ class LLMGenerationManager:
         return padded_output
 
     def run_llm_loop(self, gen_batch, initial_input_ids: torch.Tensor) -> Tuple[Dict, Dict]:
-        """Run main LLM generation loop."""
-        
+        """
+        运行主LLM推理循环。
+        gen_batch: 初始推理batch
+        initial_input_ids: 初始输入张量
+        返回：左侧和右侧状态字典
+        """
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
         
@@ -321,7 +365,7 @@ class LLMGenerationManager:
     def _compose_final_output(self, left_side: Dict,
                             right_side: Dict,
                             meta_info: Dict) -> Tuple[Dict, Dict]:
-        """Compose final generation output."""
+        """组合最终推理输出."""
         final_output = right_side.copy()
         final_output['prompts'] = left_side['input_ids']
         
