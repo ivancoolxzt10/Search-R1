@@ -19,43 +19,50 @@ import torch.distributed as dist
 
 from verl.utils.device import get_device_id, get_torch_device
 
-
+# ===================== Megatron 层映射计算 =====================
 def _megatron_calc_layer_map(config):
-    """Calculate the mapping of global layer_idx to local layer_idx
-    Returns:
-        layer_map (Dict: int -> tuple(int, int, int)):
-            mapping from the global layer index to
-            a tuple of (pp_rank, virtual_pp_rank, layer_idx inside model)
+    """
+    计算全局层索引到本地层索引的映射关系。
+    Megatron 分布式训练中，模型被分为多个流水线分段（pp）、每个分段又可有多个虚拟流水线（virtual pp），每个分段/虚拟分段只负责部分层。
+    返回 layer_map: {global_layer_idx: (pp_rank, virtual_pp_rank, local_layer_idx)}
     """
     from megatron.core import mpu
 
     print(f"get megatron data parallel size: {mpu.get_data_parallel_world_size()}")
 
-    pp_size = mpu.get_pipeline_model_parallel_world_size()
-    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+    pp_size = mpu.get_pipeline_model_parallel_world_size()  # 流水线并行分段数
+    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1  # 虚拟流水线分段数
+    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size  # 每个分段/虚拟分段负责的层数
+    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers  # 校验总层数
 
     layer_map = dict()
-    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
-    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers
-
-    for pp_rank_idx in range(pp_size):
-        for virtual_pp_rank_idx in range(virtual_pp_size):
+    for pp_rank_idx in range(pp_size):  # 遍历所有流水线分段
+        for virtual_pp_rank_idx in range(virtual_pp_size):  # 遍历所有虚拟流水线分段
+            # 计算当前分段的全局层偏移
             layer_offset = (
                 virtual_pp_rank_idx * (config.num_hidden_layers // virtual_pp_size) + pp_rank_idx * num_layers_per_model
             )
-            for layer_idx in range(num_layers_per_model):
+            for layer_idx in range(num_layers_per_model):  # 遍历本地模型的所有层
                 layer_map[layer_offset + layer_idx] = (
-                    pp_rank_idx,
-                    virtual_pp_rank_idx,
-                    layer_idx,
-                )
-    return layer_map
+                    pp_rank_idx,  # 流水线分段编号
+                    virtual_pp_rank_idx,  # 虚拟流水线分段编号
+                    layer_idx,  # 本地层索引
+                )  # 记录映射关系
+    return layer_map  # 返回层映射字典
 
-
+# ===================== Megatron 权重加载 =====================
 def load_state_dict_to_megatron_llama(
     state_dict, wrapped_models, config, params_dtype, is_value_model=False, tie_word_embeddings=False
 ):
-    """Load merged state_dict to sharded Megatron module in training."""
+    """
+    将合并后的 state_dict 加载到分布式 Megatron 模型中。
+    Args:
+        state_dict: 合并后的权重字典（通常由 rank0 收集）
+        wrapped_models: Megatron 分布式模型的 DDP 包装列表
+        config: 模型配置
+        params_dtype: 参数数据类型
+        is_value_model, tie_word_embeddings: 兼容其它模型接口，llama 不使用
+    """
     from megatron.core import DistributedDataParallel as LocalDDP
     from megatron.core import mpu
     from megatron.core.transformer.module import Float16Module
@@ -67,30 +74,34 @@ def load_state_dict_to_megatron_llama(
     start_time = time.time()
 
     def _get_gpt_model(model):
+        # 兼容不同包装，实际返回底层模型
         return model
 
     def broadcast_params(module):
+        # 广播所有参数，确保各 rank 参数一致
         for param in module.parameters():
             torch.distributed.broadcast(
                 param.data, src=mpu.get_data_parallel_src_rank(), group=mpu.get_data_parallel_group()
             )
 
-    dp_rank = mpu.get_data_parallel_rank()
-    pp_rank = mpu.get_pipeline_model_parallel_rank()
-    pp_size = mpu.get_pipeline_model_parallel_world_size()
-    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
-    mp_group = mpu.get_model_parallel_group()
+    dp_rank = mpu.get_data_parallel_rank()  # 数据并行 rank
+    pp_rank = mpu.get_pipeline_model_parallel_rank()  # 流水线并行 rank
+    pp_size = mpu.get_pipeline_model_parallel_world_size()  # 流水线分段数
+    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1  # 虚拟流水线分段数
+    mp_group = mpu.get_model_parallel_group()  # 模型并行通信组
 
+    # rank0 校验分布式并行配置
     if torch.distributed.get_rank() == 0:
         assert mp_group.rank() == 0, f"mp_rank:[{mp_group.rank}] != 0 on rank #0"
         assert pp_rank == 0, f"pp_rank:[{pp_rank}] != 0 on rank #0"
         assert dp_rank == 0, f"dp_rank:[{dp_rank}] != 0 on rank #0"
 
+    # 保证 wrapped_models 为列表
     if not isinstance(wrapped_models, list | tuple):
         wrapped_models = list(wrapped_models)
 
-    assert len(wrapped_models) == virtual_pp_size
-    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
+    assert len(wrapped_models) == virtual_pp_size  # 每个虚拟分段一个模型
+    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size  # 每个模型负责的层数
     assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers, (
         f"num_layers_per_model: {num_layers_per_model} * pp_size: {pp_size} * virtual_pp_size "
         f"{virtual_pp_size} != config.num_hidden_layers: {config.num_hidden_layers}"
@@ -98,35 +109,41 @@ def load_state_dict_to_megatron_llama(
 
     models = [None] * len(wrapped_models)
 
+    # 解包 DDP，获得底层模型
     for i, wrapped_model in enumerate(wrapped_models):
         models[i] = unwrap_model(wrapped_model, (torchDDP, LocalDDP, Float16Module))
         gpt_model_module = _get_gpt_model(models[i])
-        assert len(gpt_model_module.model.layers) == num_layers_per_model
+        assert len(gpt_model_module.model.layers) == num_layers_per_model  # 校验层数
 
+    # ===================== 分布式张量广播辅助函数 =====================
     def _broadcast_tensor(tensor, name) -> torch.Tensor:
-        """broadcast tensor from rank0 across mp_group"""
+        """
+        从 rank0 广播张量到所有 mp_group 成员。
+        用于分布式权重加载。
+        """
         nonlocal state_dict
         nonlocal mp_group
         if torch.distributed.get_rank() == 0:
             if name in state_dict:
-                weight = state_dict[name]
+                weight = state_dict[name]  # rank0 拿到权重
                 tensor_shape = weight.shape
             else:
-                tensor_shape = None
+                tensor_shape = None  # 权重不存在
         else:
             weight = None
             tensor_shape = None
 
         obj_list = [tensor_shape]
-        dist.broadcast_object_list(obj_list, src=0, group=mp_group)
+        dist.broadcast_object_list(obj_list, src=0, group=mp_group)  # 广播张量形状
         tensor_shape = obj_list[0]
 
         if tensor_shape is None:
-            # all or none ranks in the mp_group should reach here
+            # 所有 mp_group 成员都跳过
             print_rank_0(f"tensor:[{name}] not in state_dict, skip load")
             return
 
         if tensor is None:
+            # 非 rank0 创建空张量用于接收广播
             tensor = torch.empty(
                 tensor_shape,
                 dtype=params_dtype,
@@ -134,8 +151,8 @@ def load_state_dict_to_megatron_llama(
                 requires_grad=False,
             )
         if torch.distributed.get_rank() == 0:
-            tensor.data.copy_(weight)
-        dist.broadcast(tensor, src=0, group=mp_group)
+            tensor.data.copy_(weight)  # rank0 拷贝权重
+        dist.broadcast(tensor, src=0, group=mp_group)  # 广播权重到所有 mp_group 成员
 
     def _broadcast_tp_shard_tensor_vocab(tensor, name, chunk_dim=0, mutate_func=None) -> torch.Tensor:
         """broadcast tensor in tp shards across mp_group"""

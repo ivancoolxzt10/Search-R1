@@ -1,7 +1,7 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates  # 版权声明，标明归属和年份
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# Licensed under the Apache License, Version 2.0 (the "License");  # 采用 Apache 2.0 开源协议
+# you may not use this file except in compliance with the License.  # 使用需遵守协议条款
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -12,59 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.  # 文件说明：主入口不与 ray_trainer 合并，便于复用
 """
 
-import os
-import socket
+import os  # 导入 os 用于环境变量和文件操作
+import socket  # 导入 socket 用于获取主机名等网络相关操作
 
-import hydra
-import ray
-from omegaconf import OmegaConf
+import hydra  # 导入 Hydra，一个强大的应用配置管理框架
+import ray  # 导入 Ray，用于分布式计算
+from omegaconf import OmegaConf  # Hydra 使用的配置对象库
 
-from verl.experimental.dataset.sampler import AbstractSampler
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.reward import load_reward_manager
-from verl.utils.device import is_cuda_available
-from verl.utils.import_utils import load_extern_type
+from verl.experimental.dataset.sampler import AbstractSampler  # 导入课程学习采样器的抽象基类，用于类型检查
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env  # 获取 PPO 训练所需的默认 Ray 运行时环境
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer  # 导入核心的 PPO 训练器
+from verl.trainer.ppo.reward import load_reward_manager  # 导入加载奖励函数管理器的函数
+from verl.utils.device import is_cuda_available  # 检查 CUDA (GPU) 是否可用
+from verl.utils.import_utils import load_extern_type  # 动态从路径加载类/函数的工具
 
 
-@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)  # Hydra 主入口，加载配置
 def main(config):
-    """Main entry point for PPO training with Hydra configuration management.
-
-    Args:
-        config_dict: Hydra configuration dictionary containing training parameters.
     """
-    run_ppo(config)
+    使用 Hydra 配置管理的 PPO 训练主入口点。
+    原理：`@hydra.main` 装饰器会自动读取 `config` 目录下的 `ppo_trainer.yaml` 文件，
+    将其解析成一个 OmegaConf 对象 `config`，并传递给 `main` 函数。
+    这使得我们可以通过命令行轻松地覆盖配置文件中的任何参数，例如 `python main.py trainer.nnodes=4`。
+    """
+    run_ppo(config)  # 执行 PPO 训练主流程
 
 
-# Define a function to run the PPO-like training process
 def run_ppo(config) -> None:
-    """Initialize Ray cluster and run distributed PPO training process.
-
-    Args:
-        config: Training configuration object containing all necessary parameters
-                for distributed PPO training including Ray initialization settings,
-                model paths, and training hyperparameters.
     """
-    # Check if Ray is not initialized
-    if not ray.is_initialized():
-        # Initialize Ray with a local cluster configuration
-        # Set environment variables in the runtime environment to control tokenizer parallelism,
-        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
-        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
-        default_runtime_env = get_ppo_ray_runtime_env()
-        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
-        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
-        runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
-        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        print(f"ray init kwargs: {ray_init_kwargs}")
+    初始化 Ray 集群并运行分布式的 PPO 训练过程。
+    """
+    # 检查 Ray 是否已经初始化
+    if not ray.is_initialized():  # 判断 Ray 是否已初始化
+        # 如果没有，则根据配置初始化一个本地或多节点的 Ray 集群
+        default_runtime_env = get_ppo_ray_runtime_env()  # 获取默认的运行时环境（包含一些推荐的环境变量设置）
+        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})  # 从配置文件中获取用户自定义的 ray 初始化参数
+        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})  # 获取运行环境参数
+        runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)  # 将默认和用户的运行时环境配置合并，用户配置会覆盖默认配置
+        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})  # 更新 ray_init_kwargs，使用合并后的 runtime_env
+        print(f"ray init kwargs: {ray_init_kwargs}") # 打印最终的 Ray 初始化参数，便于调试
+        # 使用最终的参数初始化 Ray。OmegaConf.to_container 将配置对象转换为 Python 的原生字典
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    # Create a remote instance of the TaskRunner class, and
-    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+    # 根据是否启用性能分析工具 (nsys) 来创建 TaskRunner Actor
     if (
         is_cuda_available
         and config.global_profiler.tool == "nsys"
@@ -73,45 +66,47 @@ def run_ppo(config) -> None:
     ):
         from verl.utils.import_utils import is_nvtx_available
 
-        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"  # 确保 NVTX 工具可用，这是 nsys 进行代码范围标记所必需的
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
-        )
+        )  # 获取 nsight 配置
+        # 创建一个带有特定运行时环境的 TaskRunner Actor，以便 nsys 可以附加到它
         runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
+        # 创建一个普通的远程 TaskRunner 实例 (Actor)
+        # .remote() 是 Ray 的语法，用于在集群的某个节点上异步地创建一个类的实例
         runner = TaskRunner.remote()
+    # 远程执行 TaskRunner 实例的 run 方法，并等待它完成
+    # `runner.run.remote(config)` 会返回一个 future 对象 (ObjectRef)
+    # `ray.get()` 会阻塞主进程，直到这个远程任务执行完毕
     ray.get(runner.run.remote(config))
 
-    # [Optional] get the path of the timeline trace file from the configuration, default to None
-    # This file is used for performance analysis
-    timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
+    # (可选功能) 生成 Ray 的时间线追踪文件，用于性能分析
+    timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)  # 获取性能分析文件路径
     if timeline_json_file:
-        ray.timeline(filename=timeline_json_file)
+        ray.timeline(filename=timeline_json_file)  # 保存 Ray 的任务调度和执行时间线
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+@ray.remote(num_cpus=1)  # 这是一个 Ray Actor 定义。`num_cpus=1` 告诉 Ray 调度器为这个 Actor 分配一个 CPU 核心
 class TaskRunner:
-    """Ray remote class for executing distributed PPO training tasks.
-
-    This class encapsulates the main training logic and runs as a Ray remote actor
-    to enable distributed execution across multiple nodes and GPUs.
-
-    Attributes:
-        role_worker_mapping: Dictionary mapping Role enums to Ray remote worker classes
-        mapping: Dictionary mapping Role enums to resource pool IDs for GPU allocation
+    """
+    一个 Ray 远程类，用于执行分布式的 PPO 训练任务。
+    原理：这个类封装了主要的训练设置逻辑。把它变成一个 Actor，意味着它的所有方法都将在
+    一个独立的、远程的进程中执行，从而将繁重的设置工作从主进程中分离出来。
     """
 
     def __init__(self):
-        self.role_worker_mapping = {}
-        self.mapping = {}
+        # 初始化两个字典，用于存储角色到工作者类和资源池的映射
+        self.role_worker_mapping = {} # 例如: Role.ActorRollout -> ActorRolloutRefWorker class
+        self.mapping = {} # 例如: Role.ActorRollout -> "global_pool"
 
     def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker based on the actor strategy."""
+        """根据 actor 的并行策略 (strategy) 添加 Actor-Rollout 工作者。"""
         from verl.single_controller.ray import RayWorkerGroup
-
+        # 根据配置是 fsdp 还是 megatron，从不同的模块导入相应的 Worker 类
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
+            # 根据 rollout 模式是同步还是异步，选择不同的 Worker 实现
             actor_rollout_cls = (
                 AsyncActorRolloutRefWorker
                 if config.actor_rollout_ref.rollout.mode == "async"
@@ -121,7 +116,6 @@ class TaskRunner:
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
             from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
             actor_rollout_cls = (
                 AsyncActorRolloutRefWorker
                 if config.actor_rollout_ref.rollout.mode == "async"
@@ -133,20 +127,22 @@ class TaskRunner:
             raise NotImplementedError
 
         from verl.trainer.ppo.ray_trainer import Role
-
+        # 将 Role 枚举和实际的 Worker 类关联起来
+        # ray.remote() 将普通的 Python 类转换为 Ray Actor 类，这样它就可以被远程实例化
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
-        """Add critic worker to role mapping."""
+        """添加 Critic 工作者到角色映射中。"""
+        # 同样，根据并行策略选择不同的 CriticWorker 实现
         if config.critic.strategy in {"fsdp", "fsdp2"}:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+            # 这里还处理了一个新旧实现切换的逻辑
             if use_legacy_worker_impl in ["auto", "enable"]:
                 from verl.workers.fsdp_workers import CriticWorker
             elif use_legacy_worker_impl == "disable":
                 from verl.workers.roles import CriticWorker
-
                 print("Using new worker implementation")
             else:
                 raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
@@ -158,28 +154,29 @@ class TaskRunner:
             raise NotImplementedError
 
         from verl.trainer.ppo.ray_trainer import Role
-
         self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
 
     def init_resource_pool_mgr(self, config):
-        """Initialize resource pool manager."""
+        """初始化资源池管理器。"""
         from verl.trainer.ppo.ray_trainer import Role
-
         global_pool_id = "global_pool"
+        # 定义一个名为 "global_pool" 的资源池
+        # 它的规格是 [每个节点的GPU数] 重复 nnodes 次
+        # 例如，4个节点，每个节点8卡，就是 [8, 8, 8, 8]
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
+        # 将所有角色都映射到这个全局资源池
         self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-
+        # 创建资源池管理器实例
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
         return resource_pool_manager
 
     def add_reward_model_worker(self, config):
-        """Add reward model worker if enabled."""
+        """如果启用了奖励模型，则添加相应的 Reward Model 工作者。"""
         from verl.trainer.ppo.ray_trainer import Role
-
         if config.reward_model.enable:
             if config.reward_model.strategy in {"fsdp", "fsdp2"}:
                 from verl.workers.fsdp_workers import RewardModelWorker
@@ -191,63 +188,42 @@ class TaskRunner:
             self.mapping[Role.RewardModel] = "global_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker if KL loss or KL reward is used."""
+        """如果使用了 KL 散度损失或奖励，则添加参考策略 (Reference Policy) 工作者。"""
         from verl.trainer.ppo.ray_trainer import Role
-
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
     def run(self, config):
-        """Execute the main PPO training workflow.
-
-        This method sets up the distributed training environment, initializes
-        workers, datasets, and reward functions, then starts the training process.
-
-        Args:
-            config: Training configuration object containing all parameters needed
-                   for setting up and running the PPO training process.
         """
-        # Print the initial configuration. `resolve=True` will evaluate symbolic values.
+        执行主要的 PPO 训练工作流。
+        """
         from pprint import pprint
-
         from omegaconf import OmegaConf
-
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
-        OmegaConf.resolve(config)
+        pprint(OmegaConf.to_container(config, resolve=True)) # 打印解析后的完整配置，便于调试
+        OmegaConf.resolve(config) # 确保配置中的所有变量引用都被解析
 
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        # 从远程存储（如HDFS）下载模型权重到本地
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
 
-        # Instantiate the tokenizer and processor.
+        # 实例化 Tokenizer 和 Processor (用于多模态)
         from verl.utils import hf_processor, hf_tokenizer
-
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
+        # 按照配置添加各种工作者
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
-
-        # We should adopt a multi-source reward function here:
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # finally, we combine all the rewards together
-        # The reward type depends on the tag of the data
         self.add_reward_model_worker(config)
-
-        # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
-        # Load the reward manager for training and validation.
+        # 加载训练和验证用的奖励函数管理器
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
@@ -255,99 +231,74 @@ class TaskRunner:
             config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
 
+        # 初始化资源池管理器
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
-        # Create training and validation datasets.
+        # 创建训练和验证数据集，以及训练数据采样器
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        # Initialize the PPO trainer.
+        # 实例化核心的 PPO 训练器
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
-            role_worker_mapping=self.role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
+            role_worker_mapping=self.role_worker_mapping, # 传入角色->Worker类的映射
+            resource_pool_manager=resource_pool_manager, # 传入资源管理器
             ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
+            reward_fn=reward_fn, # 传入奖励函数
             val_reward_fn=val_reward_fn,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize the workers of the trainer.
+        # 初始化训练器中的所有分布式工作者 (Actor)
         trainer.init_workers()
-        # Start the training process.
+        # 开始训练循环
         trainer.fit()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
-    """Create a dataset.
-
-    Arguments:
-        data_paths: List of paths to data files.
-        data_config: The data config.
-        tokenizer (Tokenizer): The tokenizer.
-        processor (Processor): The processor.
-
-    Returns:
-        dataset (Dataset): The dataset.
-    """
+    """一个工厂函数，用于创建数据集。"""
     from torch.utils.data import Dataset
-
     from verl.utils.dataset.rl_dataset import RLHFDataset
 
-    # Check if a custom dataset class is specified in the data configuration
-    # and if the path to the custom class is provided
+    # 检查配置中是否指定了自定义的数据集类
     if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
-        # Dynamically load the custom dataset class
+        # 动态加载自定义类
         dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
-        # Verify that the custom dataset class inherits from torch.utils.data.Dataset
         if not issubclass(dataset_cls, Dataset):
-            raise TypeError(
-                f"The custom dataset class '{data_config.custom_cls.name}' from "
-                f"'{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset"
-            )
+            raise TypeError(f"自定义数据集类 '{data_config.custom_cls.name}' 必须继承自 torch.utils.data.Dataset")
+    # 检查是否配置了动态数据生成
     elif "datagen" in data_config and data_config.datagen.get("path", None) is not None and is_train:
-        # If a data generation strategy is specified, use the DynamicGenDataset class
         from verl.utils.dataset.dynamicgen_dataset import DynamicGenDataset
-
         dataset_cls = DynamicGenDataset
         print("Using DynamicGenDataset for data generation.")
-
     else:
-        # Use the default RLHFDataset class if no custom class is specified
+        # 使用默认的 RLHF 数据集类
         dataset_cls = RLHFDataset
     print(f"Using dataset class: {dataset_cls.__name__}")
 
-    # Instantiate the dataset using the determined dataset class
+    # 实例化并返回数据集对象
     dataset = dataset_cls(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
     )
-
     return dataset
 
 
 def create_rl_sampler(data_config, dataset):
-    """Create a sampler for the dataset.
-
-    Arguments:
-        data_config: The data config.
-        dataset (Dataset): The dataset.
-
-    Returns:
-        sampler (Sampler): The sampler.
-    """
+    """一个工厂函数，用于创建数据采样器。"""
     import torch
     from torch.utils.data import RandomSampler, SequentialSampler
 
+    # 检查是否配置了自定义的课程学习 (curriculum learning) 采样器
     if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
         curriculum_class = load_extern_type(
             data_config.sampler.class_path,
@@ -358,24 +309,21 @@ def create_rl_sampler(data_config, dataset):
             data_config=data_config,
         )
         assert isinstance(sampler, AbstractSampler)
+        # 课程学习采样器不能和多进程数据加载同时使用，因为多进程会预取数据，破坏课程顺序
         assert data_config.get("dataloader_num_workers", 8) == 0, (
-            "If using curriculum, num_workers must be 0 to prevent data caching. "
-            "If the dataloader caches data before the batch is done the "
-            "curriculum sampler won't have the opportunity to reorder it. "
+            "使用课程学习时，dataloader_num_workers 必须为 0，以防止数据被缓存。"
         )
-
-    # Use a sampler to facilitate checkpoint resumption.
-    # If shuffling is enabled in the data configuration, create a random sampler.
+    # 如果配置了 shuffle=True，则使用随机采样器
     elif data_config.shuffle:
         train_dataloader_generator = torch.Generator()
         train_dataloader_generator.manual_seed(data_config.get("seed", 1))
         sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
+    # 否则，使用顺序采样器
     else:
-        # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.
         sampler = SequentialSampler(data_source=dataset)
-
     return sampler
 
 
+# Python 的标准入口点。当直接运行此脚本时，`main()` 函数会被调用。
 if __name__ == "__main__":
     main()

@@ -1,27 +1,34 @@
+# 版权声明，表明代码归属 Bytedance Ltd. 及其关联公司所有
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
+# 许可证声明，采用 Apache License 2.0，允许合规使用和分发
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
+# 除非法律要求或书面同意，否则按“原样”分发，不提供任何明示或暗示的担保
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# 导入 inspect、logging、socket 等标准库模块
 import inspect
 import logging
 import socket
 from copy import deepcopy
 from typing import Any, Optional
 
+# 导入 ray 及其调度相关工具
 import ray
 from ray.experimental.state.api import get_actor
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
+# 导入分布式协议和工具类
 from verl.protocol import DataProto, _padding_size_key
 from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
@@ -29,6 +36,7 @@ from verl.utils.py_functional import temp_env_var
 
 __all__ = ["Worker"]
 
+# 生成随机字符串，用于命名等场景
 
 def get_random_string(length: int) -> str:
     import random
@@ -37,16 +45,21 @@ def get_random_string(length: int) -> str:
     letters_digits = string.ascii_letters + string.digits
     return "".join(random.choice(letters_digits) for _ in range(length))
 
+# Ray 分布式方法生成器，负责分发、收集、执行和结果处理
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
     class Functor:
         def __call__(this, *args, **kwargs):
+            # 分发参数
             args, kwargs = dispatch_fn(self, *args, **kwargs)
             padding_count = kwargs.pop(_padding_size_key, 0)
+            # 执行方法
             output = execute_fn(method_name, *args, **kwargs)
             if blocking:
                 output = ray.get(output)
+            # 收集结果
             output = collect_fn(self, output)
+            # 去除填充部分
             if padding_count > 0:
                 if isinstance(output, DataProto):
                     indices = [i for i in range(len(output))][:-padding_count]
@@ -54,30 +67,25 @@ def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, block
                 elif isinstance(output, list):
                     output = output[:-padding_count]
             return output
-
-    # use class type to pass the method_name to get a better observability
+    # 用类类型传递 method_name，便于可观测性
     return type(method_name, (Functor,), {})()
 
+# 按节点 IP 对 placement group 排序，保证分布式 rank 一致性
 
 def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[PlacementGroup]:
     """
-    Sort the placement groups by node ip, all bundles in a single placement group should be on the same node.
-
-    FSDPCheckpointManager saves sharded model states and optimizer states in local storage, which requires RANK
-    to be consistent across nodes when resume from checkpoint.
-
-    With this function, if there's only one resource pool and there's no node change, RANK should be consistent
-    across nodes in multiple ray jobs, even if the whole ray cluster is restarted.
+    按节点 IP 排序 placement group，保证分布式 rank 一致性。
+    用于 FSDPCheckpointManager 的分布式恢复。
     """
     node_ip = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes()}
     pg_ip = {}
     for pg in pgs:
         specs = ray._private.state.state.placement_group_table(pg.id)
-        # all bunles should be on the same node
         node_id = specs["bundles_to_node_id"][0]
         pg_ip[pg.id] = node_ip[node_id]
     return sorted(pgs, key=lambda pg: pg_ip[pg.id])
 
+# Ray 远程方法，获取主节点地址和端口
 
 @ray.remote
 def get_master_addr_port() -> tuple[str, str]:
@@ -87,7 +95,7 @@ def get_master_addr_port() -> tuple[str, str]:
         port = sock.getsockname()[1]
     return addr, str(port)
 
-
+# Ray 资源池类，继承自 ResourcePool，支持 GPU/CPU 分布式资源管理
 class RayResourcePool(ResourcePool):
     def __init__(
         self,
@@ -98,6 +106,7 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
     ) -> None:
+        # 初始化资源池，设置进程分布、GPU 使用、命名规则、最大共置数量、分离状态及加速器类型
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
         # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
@@ -107,6 +116,7 @@ class RayResourcePool(ResourcePool):
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
+        # 获取 Placement Group 列表，支持严格打包和名称前缀
         if self.pgs is not None:
             return self.pgs
 
@@ -128,6 +138,7 @@ class RayResourcePool(ResourcePool):
 
         lifetime = "detached" if self.detached else None
 
+        # 创建 Placement Group
         pgs = [
             placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
             for idx, bundles in enumerate(pg_scheme)
@@ -142,6 +153,7 @@ class RayResourcePool(ResourcePool):
 def extract_pg_from_exist(
     resource_pools: dict[str, RayResourcePool], src_role_names: list[str], resource_pool: RayResourcePool
 ) -> list:
+    # 从已存在的资源池中提取 Placement Group，保证满足进程需求
     src_pgs = [
         pg
         for role_name, resource_pool in resource_pools.items()
@@ -166,6 +178,7 @@ def extract_pg_from_exist(
 
 
 def merge_resource_pool(rp1: RayResourcePool, rp2: RayResourcePool) -> RayResourcePool:
+    # 合并两个资源池，要求 GPU 使用、最大共置数量、每节点 GPU 数量和分离状态一致
     assert rp1.use_gpu == rp2.use_gpu, "Both RayResourcePool must either use_gpu or not"
     assert rp1.max_colocate_count == rp2.max_colocate_count, "Both RayResourcePool must has the same max_colocate_count"
     assert rp1.n_gpus_per_node == rp2.n_gpus_per_node, "Both RayResourcePool must has the same n_gpus_per_node"

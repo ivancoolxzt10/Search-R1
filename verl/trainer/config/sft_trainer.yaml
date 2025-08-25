@@ -1,85 +1,229 @@
 data:
+  # --- 批处理大小配置 ---
   train_batch_size: 256
+  # 中文解释: 训练过程中的全局批处理大小。
+  # 原理: 这是在所有 GPU 上，完成一次模型权重更新（即一个优化器步骤）所处理的样本总数。它是影响模型收敛性的关键超参数。更大的全局批量通常能提供更稳定的梯度，但也需要更多的总显存。
+
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
+  # 中文解释: 一个即将被废弃的参数，应使用下面的 `micro_batch_size_per_gpu`。
+  # 原理: 这是一个注释，提醒用户此配置项已过时。
+
   micro_batch_size_per_gpu: 4  # this is also val batch size
+  # 中文解释: 每个 GPU 在一次前向/后向传播中处理的样本数量（微批次大小）。验证时也使用这个批量大小。
+  # 原理: 这是管理单个 GPU 显存占用的核心参数。为了达到 `train_batch_size`，系统会使用梯度累积技术。计算公式为：`全局批大小 = 微批大小 * GPU总数 * 梯度累积步数`。在此配置下，梯度累积步数为 `256 / (4 * 8) = 8` 步（假设有8个GPU）。这意味着计算机会跑8次微批次，累积它们的梯度，然后才更新一次模型权重。
+
+  # --- 文件路径和数据字段名 ---
   train_files: ~/data/gsm8k/train.parquet
   val_files: ~/data/gsm8k/test.parquet
-  # Single-turn settings
+  # 中文解释: 指定训练和验证数据集文件的路径。`~` 代表用户的主目录。
+  # 原理: Parquet 是一种高效的列式存储格式，非常适合处理大型数据集，读取速度通常比 CSV 或 JSON 更快。
+
+  # --- 单轮对话设置 ---
   prompt_key: question
   response_key: answer
+  # 中文解释: 指定数据文件中作为“提示(prompt)”和“回答(response)”的列名。
+  # 原理: 数据加载器会根据这些键（key）去 Parquet 文件中查找对应的列，以构建训练样本。
+
   prompt_dict_keys: null
   response_dict_keys: null
-  # Multi-turn settings
+  # 中文解释: 如果提示或回答在数据文件中是结构化的字典，这里可以指定要抽取的键。`null` 表示它们是简单的字符串。
+  # 原理: 为处理更复杂的数据格式提供灵活性。
+
+  # --- 多轮对话设置 ---
   multiturn:
     enable: false  # Set to true to use multi-turn dataset
+    # 中文解释: 是否启用多轮对话数据集模式。`false` 表示使用上面的单轮设置。
+    # 原理: 这是一个开关。如果设为 `true`，数据加载器会按多轮对话的格式解析数据，此时单个样本包含一个消息列表。
     messages_key: messages  # Key for messages list in multi-turn mode
     tools_key: tools  # Key for tools list in multi-turn mode
     enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
+    # 中文解释: 在多轮模式下，指定包含消息列表、工具列表和“思考”字段的列名。
+    # 原理: 为处理类似聊天记录的复杂数据结构提供配置。
+
+  # --- 数据处理设置 ---
   max_length: 1024
+  # 中文解释: 模型处理的最大序列长度（以 token 为单位）。
+  # 原理: 任何长度超过这个值的输入都会被截断。这个参数直接影响 GPU 显存占用和计算时间，是性能和模型能力之间的权衡。
+
   truncation: error
+  # 中文解释: 当序列超过 `max_length` 时的处理策略。`error` 表示直接报错。
+  # 原理: 这是一种严格的数据检查策略，有助于在数据预处理阶段发现问题，确保没有数据被意外截断而丢失信息。其他可能的值有 `'truncate'`（截断）。
+
   balance_dp_token: False
+  # 中文解释: 是否在数据并行（DP）组内平衡每个 GPU 上的 token 总数。
+  # 原理: 一种高级优化。如果设为 `true`，数据加载器会尝试构建批次，使得每个 GPU 处理的 token 总量大致相等，从而平衡计算负载，避免某些 GPU 等待其他 GPU 完成。
+
   chat_template: null
+  # 中文解释: 指定一个聊天模板，用于将数据格式化为模型需要的特定对话格式。
+  # 原理: 很多指令微调模型需要特定的格式来区分用户、助手和系统角色（例如，使用 `[INST]`、`<s>` 等特殊标记）。这里可以指定一个 Jinja2 模板（Hugging Face 标准）来自动完成这个格式化工作。`null` 表示不使用模板。
+
   custom_cls:
     path: null
     name: null
+  # 中文解释: 用于指定自定义的数据集加载类。
+  # 原理: 这是一个扩展点。如果你的数据格式非常特殊，无法通过以上配置处理，可以在这里提供一个 Python 文件的路径 (`path`) 和一个类名 (`name`)，系统会动态加载你自己的 `Dataset` 实现。
+
   use_shm: False
+  # 中文解释: 是否使用共享内存（shared memory）来加载数据。
+  # 原理: `shm` 指的是 Linux 系统下的 `/dev/shm`，它是一块基于内存的文件系统。如果设为 `true`，数据文件可能会被先复制到这里再加载。如果你的硬盘 I/O 速度是瓶颈，且内存充足，这可以加速数据加载。
+
   apply_chat_template_kwargs: {}
+  # 中文解释: 传递给 `tokenizer.apply_chat_template` 函数的额外参数。
+  # 原理: 为使用聊天模板时提供更多灵活性。
 model:
   partial_pretrain: ~/models/gemma-1.1-7b-it
+  # 中文解释: 指定用于微调的基础预训练模型权重的路径。
+  # 原理: 这是训练的起点。模型会从这个路径加载权重，然后在此基础上进行进一步的训练。
+
   use_shm: False
+  # 中文解释: 是否使用共享内存来加载模型权重。
+  # 原理: 与数据加载中的 `use_shm` 类似，但作用于模型文件。在多进程/多节点的同一个物理机上，将模型先加载到共享内存可以加快所有进程的加载速度。
+
+  # --- FSDP (完全分片数据并行) 配置 ---
   fsdp_config:
     model_dtype: fp32
+    # 中文解释: 模型在被 FSDP 包装时初始加载的数据类型。
+    # 原理: `fp32` (32位浮点数) 提供了最高的精度。虽然这里指定了 `fp32`，但实际的训练计算通常会通过自动混合精度（AMP）在 `bfloat16` 或 `float16` 下进行，以获得性能和显存优势。
+
     wrap_policy:
       min_num_params: 0
+    # 中文解释: FSDP 的层包装策略。
+    # 原理: 这是 FSDP 的一个核心配置，它决定了如何将模型的各个层分组成分片的单元。`min_num_params: 0` 是一种激进的策略，倾向于将每个层都单独包装成一个分片单元。这能最大化地节省显存，但可能会增加通信开销。
+
     cpu_offload: False
     offload_params: False
+    # 中文解释: 是否启用 CPU 卸载（offload）。
+    # 原理: FSDP 的一种极致节省显存的技术。如果设为 `true`，FSDP 会将当前未使用到的模型参数、梯度或优化器状态从 GPU 显存移动到 CPU 内存中，在需要时再移回。这能让模型在显存极小的 GPU 上运行，但代价是由于频繁的 PCIe 数据传输，训练速度会显著变慢。
+
   external_lib: null
+  # 中文解释: 指定外部库的路径，例如用于特定模型实现的自定义代码。
+  # 原理: 提供了加载项目外代码的灵活性。
+
   enable_gradient_checkpointing: True
+  # 中文解释: 是否启用梯度检查点技术。
+  # 原理: 一种经典的用计算换显存的技术。它在前向传播过程中不保存所有中间激活值，只保存少数几个关键的“检查点”。在后向传播时，它会从最近的检查点开始重新计算前向传播，以获取计算梯度所需的激活值。这能大幅降低显存占用，但会增加约 20-30% 的计算时间。
+
   trust_remote_code: False
+  # 中文解释: 从 Hugging Face Hub 加载模型时，是否信任模型仓库中的自定义代码。
+  # 原理: 一个安全设置。某些模型需要执行其仓库中附带的 Python 代码才能正确构建。设为 `true` 表示你信任这些代码的来源。
+
+  # --- LoRA (低秩适应) 配置 ---
   lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
+  # 中文解释: LoRA 的秩。设为正数（如 32）即可启用 LoRA 微调。
+  # 原理: LoRA 是一种参数高效微调方法。它冻结原始模型的大部分权重，只在模型的特定层（如线性层）旁边增加两个小的、低秩的矩阵（A 和 B）进行训练。`lora_rank` 就是这两个小矩阵的中间维度，控制了新增参数的数量。`0` 表示不使用 LoRA。
+
   lora_alpha: 16  # LoRA scaling factor
+  # 中文解释: LoRA 的缩放因子。
+  # 原理: LoRA 的输出会乘以一个缩放因子 `alpha / rank`。调整 `alpha` 相当于调整 LoRA 对原始模型影响的权重。它是一个需要根据经验调整的超参数。
+
   target_modules: all-linear  # Target modules for LoRA adaptation
+  # 中文解释: 应用 LoRA 的目标模块。`all-linear` 是一个方便的快捷方式，表示将 LoRA 应用于模型中所有的线性层。
+  # 原理: 你可以精确控制 LoRA 应用于哪些层，例如只应用于注意力机制的 `q_proj` 和 `v_proj`。
+
   use_liger: False
+  # 中文解释: 是否使用 Liger，一个与 LoRA 相关的特定优化库或技术。
+  # 原理: 可能是一个内部或特定的优化实现，用于提升 LoRA 的训练效率。
+
   strategy: fsdp2
+  # 中文解释: 指定使用的分布式训练策略。
+  # 原理: `fsdp2` 可能指的是 PyTorch FSDP 的一个特定版本或配置集。这个字段决定了系统将如何初始化和管理分布式训练。
 optim:
   lr: 1e-5
+  # 中文解释: 学习率。
+  # 原理: 控制模型权重更新的步长。这是最重要的超参数之一，需要仔细调整。`1e-5` 是一个在微调大模型时常用的较小值。
+
   betas: [0.9, 0.95]
+  # 中文解释: AdamW 优化器的 beta 参数。
+  # 原理: AdamW 优化器使用动量（一阶矩）和自适应学习率（二阶矩）。`beta1` (0.9) 和 `beta2` (0.95) 分别是这两个矩估计的指数衰减率。这些是 AdamW 的标准推荐值。
+
   weight_decay: 0.01
+  # 中文解释: 权重衰减系数。
+  # 原理: 一种正则化技术，用于防止模型过拟合。它通过在损失函数中增加一个与权重大小成正比的惩罚项，来抑制模型权重变得过大。
+
   warmup_steps_ratio: 0.1
+  # 中文解释: 学习率预热（warmup）阶段占总训练步数的比例。
+  # 原理: 在训练初期，模型权重是随机的，梯度可能很大且不稳定。预热策略会在开始的 10% 步数内，将学习率从一个很小的值线性增加到设定的 `lr`。这有助于稳定训练初期的学习过程。
+
   clip_grad: 1.0
+  # 中文解释: 梯度裁剪的阈值。
+  # 原理: 为了防止梯度爆炸（梯度值变得非常大，导致训练不稳定），在更新权重之前，会将梯度的范数（L2 norm）限制在一个最大值 `1.0` 以内。
+
   lr_scheduler: cosine
+  # 中文解释: 学习率调度器类型。
+  # 原理: `cosine` 表示在预热阶段之后，学习率将按照余弦函数的形状从 `lr` 平滑地衰减到接近于零。这是一种非常流行且效果良好的学习率衰减策略。
 ulysses_sequence_parallel_size: 1
+# 中文解释: Ulysses 序列并行的大小。
+# 原理: 序列并行是一种更高级的并行技术，它将单个训练样本在序列维度上切分到不同的 GPU 上。`1` 表示不启用序列并行。大于1的值会启用它，以支持更长的序列长度。
+
 use_remove_padding: False
+# 中文解释: 是否使用“去填充”优化。
+# 原理: 如果设为 `true`，系统会配合 FlashAttention 等技术，将批次中无效的填充（padding）部分去除，只对有效 token 进行计算，从而大幅提升含有大量填充的批次的处理速度。
 trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  # 中文解释: 默认的本地检查点保存目录。
+  # 原理: 使用了 Hydra 的变量插值。`${...}` 会被配置文件中其他地方的值替换，最终路径会是 `checkpoints/gsm8k-sft/test`。
+
   default_hdfs_dir: null
+  # 中文解释: 默认的 HDFS (Hadoop Distributed File System) 检查点保存目录。`null` 表示不保存到 HDFS。
+  # 原理: 在大型集群环境中，通常会将检查点保存到可靠的分布式文件系统中。
+
   project_name: gsm8k-sft
   experiment_name: test
+  # 中文解释: 项目名和实验名。
+  # 原理: 用于组织日志和检查点，便于管理和追踪不同的实验。
+
   total_epochs: 4
+  # 中文解释: 总共训练的轮数（epoch）。
+  # 原理: 一个 epoch 指的是模型完整地看过一遍整个训练数据集。
+
   total_training_steps: null
+  # 中文解释: 总共训练的步数。
+  # 原理: 如果设置了此值，它会覆盖 `total_epochs`。训练会在达到指定步数后停止。`null` 表示以 epoch 为准。
+
   logger: [ 'console', 'wandb' ]
+  # 中文解释: 使用的日志记录器。
+  # 原理: `'console'` 表示将日志打印到控制台。`'wandb'` 表示将训练指标（如损失、学习率）记录到 Weights & Biases 平台，用于可视化和实验追踪。
+
   seed: 1
+  # 中文解释: 随机种子。
+  # 原理: 固定随机种子可以保证实验的可复现性。每次运行时，相同的种子会产生相同的随机数序列（例如，用于权重初始化和数据打乱）。
+
   save_freq: -1
+  # 中文解释: 保存检查点的频率。`-1` 可能表示每个 epoch 结束时保存。
+  # 原理: 控制保存模型的频率，可以是步数或轮数。
+
   test_freq: -1
+  # 中文解释: 运行验证的频率。`-1` 可能表示每个 epoch 结束时验证。
+  # 原理: 控制在验证集上评估模型性能的频率。
+
   nnodes: 1
   n_gpus_per_node: 8
+  # 中文解释: 使用的计算节点数量和每个节点的 GPU 数量。
+  # 原理: 定义了分布式训练的硬件规模。这里是单机 8 卡。
+
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
+  # 中文解释: 最多保留的检查点数量。`null` 表示保留所有。
+  # 原理: 用于管理磁盘空间。如果设为 3，当保存第 4 个检查点时，会自动删除最早的那个。
 
-  # Resume mode: "auto", "disable", or "resume_path"
-  # "auto": resume from last checkpoint if available
-  # "disable": start from scratch
-  # "resume_path": resume from a user-defined path
+  # --- 训练恢复配置 ---
   resume_mode: auto
+  # 中文解释: 训练恢复模式。
+  # 原理: `'auto'` 表示如果检查点目录中存在上一次的检查点，就自动从中恢复训练。`'disable'` 表示总是从头开始。`'resume_path'` 表示从下面指定的路径恢复。
 
-  # Path to resume training from (used when resume_mode is "resume_path" or "auto")
   resume_from_path: null
+  # 中文解释: 当 `resume_mode` 为 `'resume_path'` 时，指定从中恢复的检查点路径。
+  # 原理: 提供手动指定恢复点的能力。
 
-  # Checkpoint configuration
+  # --- 检查点内容配置 ---
   checkpoint:
-    # What to include in saved checkpoints
-    # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
     save_contents: ["model", "optimizer", "extra"]
+    # 中文解释: 保存检查点时包含的内容。
+    # 原理: `'model'` 指模型权重，`'optimizer'` 指优化器状态（如动量），`'extra'` 可能包含学习率调度器状态、当前 epoch/step 等。保存优化器状态是实现无缝恢复训练的关键。
 
-    # For more flexibility, you can specify the contents to load from the checkpoint.
     load_contents: ${trainer.checkpoint.save_contents}
+    # 中文解释: 从检查点加载时要加载的内容。
+    # 原理: 使用 Hydra 插值，默认加载所有保存的内容。可以灵活地只加载部分内容，例如只加载模型权重而不加载优化器状态（相当于重新开始训练）。
+
   device: cuda
+  # 中文解释: 训练使用的设备。
+  # 原理: `'cuda'` 表示使用 NVIDIA GPU。其他可能的值有 `'cpu'`。

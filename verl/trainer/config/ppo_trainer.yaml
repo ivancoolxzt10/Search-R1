@@ -5,211 +5,318 @@
 # 4. Indentation level is respected for nested fields.
 
 # specify the default per-component configs
+# specify the default per-component configs
+# 指定每个组件的默认配置文件
 defaults:
 
   # <folder_name>@<field_name>.<field_name>: <yaml_file_name>
   # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
+  # 语法解释：<文件夹名>@<配置中的目标路径>: <要加载的yaml文件名>
+  # 这一行表示：从 `config/actor` 文件夹中加载 `dp_actor.yaml` 文件，
+  # 并将其内容填充到最终配置的 `actor_rollout_ref.actor` 路径下。
   - actor@actor_rollout_ref.actor: dp_actor
 
   # data: trainer/config/data/legacy_data.yaml
+  # 加载 `config/data/legacy_data.yaml` 文件到 `data` 字段。
   - data@data: legacy_data
 
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
+  # 参考模型配置。当 actor.use_kl_loss 或 algorithm.use_kl_in_reward 为 True 时，参考模型将被启用。
   - ref@actor_rollout_ref.ref: dp_ref
 
   # Rollout model config.
+  # Rollout (经验生成) 模型配置。
   - rollout@actor_rollout_ref.rollout: rollout
 
   # Critic model config.
+  # Critic (价值) 模型配置。
   - critic@critic: dp_critic
 
   # Reward model config.
+  # 奖励模型配置。
   - reward_model@reward_model: dp_reward_model
 
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
+  # 加载所有默认配置后，应用当前 YAML 文件中的字段。
+  # `_self_` 表示当前文件，它的配置会覆盖上面所有 defaults 加载进来的同名配置。
   - _self_
 
 # config for actor, rollout and reference model
+# config for actor, rollout and reference model
+# Actor、Rollout 和参考模型的配置
 actor_rollout_ref:
 
   # Whether it's a hybrid engine, currently only supports hybrid engine
+  # 是否为混合引擎，目前只支持混合引擎。
   hybrid_engine: true
+  # 原理: "混合引擎"通常指一个工作者（Worker）同时承担多个角色，如此处的 Actor、Rollout 和 Ref Policy。
+  # 这可以减少进程数量，优化资源利用，特别是在 LoRA 微调场景下，这三个角色可以共享大部分模型权重。
 
   # Timeout for operations executed against the process group
+  # 分布式通信组操作的超时时间（秒）。
   nccl_timeout: 600
+  # 原理: 在分布式训练中，进程间需要通过 NCCL 等库进行通信（如 All-Reduce）。
+  # 如果某个进程卡住，会导致其他进程一直等待。设置超时可以防止训练无限期挂起，并在出现问题时报错退出。
 
   # common configs for the model
+  # 模型的通用配置
   model:
 
     # Huggingface model path. This can be either local path or HDFS path.
+    # Huggingface 模型路径，可以是本地路径或 HDFS 路径。
     path: ~/models/deepseek-llm-7b-chat
 
     # Custom chat template for the model.
+    # 模型的自定义聊天模板。
     custom_chat_template: null
 
     # Whether to use shared memory (SHM) for accelerating the loading of model weights
+    # 是否使用共享内存（SHM）来加速模型权重的加载。
     use_shm: false
+    # 原理: SHM (`/dev/shm`) 是基于内存的文件系统。将模型权重先加载到 SHM，
+    # 可以让同一台物理机上的多个训练进程更快地读取模型，避免重复的磁盘 I/O。
 
     # Additional Python packages to register huggingface models/tokenizers.
+    # 用于注册 Huggingface 模型/分词器的额外 Python 包。
     external_lib: null
 
     # Used to override model's original configurations, mainly dropout
+    # 用于覆盖模型原始配置的字段，主要用于调整 dropout。
     override_config: {}
 
     # Enable gradient checkpointing for actor
+    # 为 Actor 启用梯度检查点。
     enable_gradient_checkpointing: true
+    # 原理: 一种经典的“以计算换显存”技术。通过在反向传播时重新计算部分前向传播的激活值，
+    # 来减少需要存储在显存中的激活值总量，从而支持更大模型或更长的序列。
 
     # Enable activation offloading for actor
+    # 为 Actor 启用激活值卸载。
     enable_activation_offload: false
+    # 原理: 梯度检查点的进一步优化。它将没有被检查点保存的激活值卸载到 CPU 内存，
+    # 进一步降低 GPU 显存占用，但会因为 PCIe 传输而减慢速度。
 
     # Whether to remove padding tokens in inputs during training
+    # 训练时是否移除输入中的填充（padding）token。
     use_remove_padding: false
+    # 原理: 配合 FlashAttention 等技术，只对有效 token 进行计算，避免在 padding 上浪费计算资源，从而提升效率。
 
     # Set to positive value to enable LoRA (e.g., 32)
+    # 设置为正数以启用 LoRA（例如 32）。
     lora_rank: 0
+    # 原理: LoRA 的秩（rank），控制了新增参数的数量。0 表示不使用 LoRA。
 
     # LoRA scaling factor
+    # LoRA 的缩放因子。
     lora_alpha: 16
+    # 原理: LoRA 的输出会乘以 `alpha / rank` 进行缩放，`alpha` 是一个用于平衡 LoRA 影响力的超参数。
 
     # Target modules to apply LoRA. Options: "all-linear" (not recommended for VLMs) or
     # [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
+    # 应用 LoRA 的目标模块。
     target_modules: all-linear
+    # 原理: `all-linear` 会自动将 LoRA 应用于模型中所有的线性层。也可以手动指定一个列表来精确控制。
 
     # Exclude modules from applying Lora. Similar usage to target_modules and Peft.
     # Example: '.*visual.*' for excluding the ViT in Qwen2.5-VL, as currently vllm does not support ViT Lora.
+    # 从 LoRA 应用中排除的模块。
     exclude_modules: null
+    # 原理: 提供更精细的控制，例如在多模态模型中，只对语言部分应用 LoRA，排除视觉部分。
 
     # Whether to use Liger for linear layer fusion
+    # 是否使用 Liger 进行线性层融合。
     use_liger: false
+    # 原理: Liger 可能是一个优化库，可以将多个线性层操作融合成一个 GPU Kernel，以减少开销，提升性能。
 
     # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
+    # 是否使用自定义的融合内核（例如 FlashAttention, 融合 MLP）。
     use_fused_kernels: false
 
     # Options for fused kernels. If use_fused_kernels is true, this will be used.
+    # 融合内核的选项。
     fused_kernel_options:
 
       # Implementation backend for fused kernels. Options: "triton" or "torch".
+      # 融合内核的实现后端。可选 "triton" 或 "torch"。
       impl_backend: torch
+      # 原理: Triton 是一种用于编写高性能 GPU 内核的 Python DSL，通常性能更高。
+      # "torch" 则可能使用 PyTorch 2.0 的 `torch.compile` 或其他原生实现。
 
     # Whether to enable loading a remote code model
+    # 是否允许加载需要执行远程代码的模型。
     trust_remote_code: false
+    # 原理: Hugging Face 的一个安全特性。设为 `true` 表示你信任模型仓库中的自定义 Python 代码。
 
   # Rollout model config.
+  # Rollout (经验生成) 模型配置。
   rollout:
 
     # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
+    # 设为 True 可能会获得更高吞吐量。激活时，请增大 max_num_batched_tokens 或减小 max_model_len。
     enable_chunked_prefill: True
+    # 原理: 这是 vLLM 等推理引擎的一项优化。它将长 prompt 的 prefill 阶段（计算 KV 缓存）分块进行，
+    # 避免了因单个长 prompt 占用所有计算资源而导致短 prompt 等待，从而提高整体吞吐量。
 
     # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
     # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
+    # Rollout 模型权重使用的加载器。
     load_format: dummy_dtensor
+    # 原理: `dummy_dtensor` 表示不实际加载权重，而是随机初始化。这在只需要模型结构进行开发调试时非常有用，可以极大地加快启动速度。
+    # 其他选项如 `hf` (Hugging Face 格式)、`safetensors` (更安全、快速的格式) 用于实际加载权重。
 
     # for huge model, layered summon can save memory (prevent OOM) but make it slower
+    # 对于巨型模型，分层加载可以节省内存（防止OOM），但会变慢。
     layered_summon: False
+    # 原理: FSDP 加载模型时的一种策略。分层加载会逐层地将模型参数加载到 GPU，而不是一次性全部加载，从而降低峰值内存占用。
 
 # custom reward function definition
+# custom reward function definition
+# 自定义奖励函数的定义
 custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
+  # 包含你的自定义奖励函数的文件的路径。
   path: null
+  # 原理: 提供了扩展性。你可以编写自己的 Python 文件，实现一个奖励函数，然后在这里指定路径，系统会自动加载。
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
+  # 指定文件中的奖励函数名称。默认为 'compute_score'。
   name: compute_score
 
 # config for the algorithm
+# config for the algorithm
+# 算法的配置
 algorithm:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # 当使用 verl.utils.omega_conf_to_dataclass 实例化数据类配置时需要此字段。
   _target_: verl.trainer.config.AlgoConfig
+  # 原理: 这是 Hydra 的一个特性，称为“实例化”。它告诉 Hydra，这个配置块对应于 `verl.trainer.config.AlgoConfig` 这个 Python 类。
+  # Hydra 会自动用下面的字段作为参数来创建这个类的一个实例。
 
   # Discount factor for future rewards
+  # 未来奖励的折扣因子。
   gamma: 1.0
+  # 原理: gamma 决定了未来的奖励相对于当前奖励的重要性。值为 1.0 表示不折扣，适用于回合制任务。小于 1 的值用于无限时长的任务。
 
   # Trade-off between bias and variance in the GAE estimator
+  # GAE (广义优势估计) 中偏差和方差的权衡参数。
   lam: 1.0
+  # 原理: lambda (lam) 用于 GAE 算法。值为 1.0 等价于蒙特卡洛估计（高方差，低偏差），值为 0 则等价于 TD(0) 估计（低方差，高偏差）。
 
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+  # 优势估计器类型。
   adv_estimator: gae
 
   # Whether to normalize advantages by std (specific to GRPO)
+  # 是否按标准差归一化优势值（GRPO 算法特有）。
   norm_adv_by_std_in_grpo: True
 
   # Whether to enable in-reward KL penalty
+  # 是否启用奖励内 KL 惩罚。
   use_kl_in_reward: False
+  # 原理: 如果为 `true`，会在计算最终奖励时减去一个与 KL 散度成正比的惩罚项，以约束策略模型不过于偏离参考模型。
 
   # How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full"
+  # 如何估计 KL 散度。
   kl_penalty: kl
 
   # KL control configuration
+  # KL 控制配置
   kl_ctrl:
 
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.trainer.config.KLControlConfig
 
     # KL control type: "fixed" or "adaptive"
+    # KL 控制类型："固定" 或 "自适应"。
     type: fixed
+    # 原理: `fixed` 表示 KL 惩罚的系数 `kl_coef` 是固定的。`adaptive` 则会根据当前策略与参考策略的实际 KL 散度动态调整该系数。
 
     # Initial coefficient for KL penalty
+    # KL 惩罚的初始系数。
     kl_coef: 0.001
 
     # Horizon value for adaptive controller (if enabled)
+    # 自适应控制器的 horizon 值。
     horizon: 10000
 
     # Target KL divergence (used for adaptive controller)
+    # 目标 KL 散度（用于自适应控制器）。
     target_kl: 0.1
 
   # Whether to enable preference feedback PPO
+  # 是否启用偏好反馈 PPO (PF-PPO)。
   use_pf_ppo: False
 
   # Preference feedback PPO settings
+  # 偏好反馈 PPO 设置
   pf_ppo:
 
     # Method for reweighting samples: "pow", "max_min", or "max_random"
+    # 样本重加权方法。
     reweight_method: pow
+    # 原理: PF-PPO 是一种处理偏好数据（例如，回答A比回答B好）的 PPO 变体。它通过对样本进行重加权来学习这种偏好。
 
     # Power used for weight scaling in "pow" method
+    # "pow" 方法中用于权重缩放的幂指数。
     weight_pow: 2.0
 
 # config for the trainer
+# config for the trainer
+# 训练器的配置
 trainer:
 
   # Whether to balance batch sizes across distributed workers
+  # 是否在分布式工作者之间平衡批次大小。
   balance_batch: True
+  # 原理: 详见 `_balance_batch` 方法，通过重排数据使得每个 DP 副本处理的 token 数大致相等，以提高并行效率。
 
   # Number of epochs in training
+  # 训练的总轮数。
   total_epochs: 30
 
   # Total training steps (can be set explicitly or derived from epochs)
+  # 总训练步数（可以显式设置，或从 epoch 推断）。
   total_training_steps: null
 
   # Project name for experiment tracking (e.g., wandb)
+  # 实验跟踪的项目名称。
   project_name: verl_examples
 
   # Experiment name for run identification in tracking tools
+  # 实验跟踪的运行名称。
   experiment_name: gsm8k
 
   # Logging backends to use: "console", "wandb", etc.
+  # 使用的日志后端。
   logger: [ 'console', 'wandb' ]
 
   # Number of generations to log during validation
+  # 验证期间要记录的生成样本数量。
   log_val_generations: 0
 
   # Directory for logging rollout data; no dump if null
+  # 记录 rollout 数据的目录；如果为 null 则不记录。
   rollout_data_dir: null
 
   # Directory for logging validation data; no dump if null
+  # 记录验证数据的目录；如果为 null 则不记录。
   validation_data_dir: null
 
   # Number of nodes used in the training
+  # 训练中使用的节点数。
   nnodes: 1
 
   # Number of GPUs per node
+  # 每个节点的 GPU 数量。
   n_gpus_per_node: 8
 
   # Save frequency (by iteration) for model checkpoints
+  # 保存模型检查点的频率（按迭代次数）。-1 可能有特殊含义，如每轮保存一次。
   save_freq: -1
 
   # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
@@ -217,102 +324,128 @@ trainer:
   # To ensure a checkpoint is saved before ESI shuts down, the system will start saving a checkpoint in advance.
   # The advance time is calculated as: Advance Time = Longest historical step duration + Checkpoint save duration + esi_redundant_time.
   # Here, esi_redundant_time is a user-defined value that further extends the advance time for added safety.
+  # ESI 指的是训练中使用的弹性服务器实例。为确保在 ESI 关闭前保存检查点，系统会提前保存。
+  # 提前的时间 = 历史最长单步耗时 + 检查点保存耗时 + esi_redundant_time。
   esi_redundant_time: 0
 
   # Resume mode: "auto", "disable", or "resume_path"
-  # "auto": resume from last checkpoint if available
-  # "disable": start from scratch
-  # "resume_path": resume from a user-defined path
+  # 恢复模式。
   resume_mode: auto
+  # 原理: `auto` 自动从最新检查点恢复，`disable` 从头开始，`resume_path` 从指定路径恢复。
 
   # Path to resume training from (only used when resume_mode is "resume_path")
+  # 用于恢复训练的路径。
   resume_from_path: null
 
   # Whether to run validation before training begins
+  # 是否在训练开始前运行一次验证。
   val_before_train: True
 
   # Whether to run validation only
+  # 是否只运行验证。
   val_only: False
 
   # Validation frequency (in training iterations)
+  # 验证频率（按训练迭代次数）。
   test_freq: -1
 
   # Number of iterations to warm up the critic before updating policy
+  # 在更新策略前，预热 Critic 的迭代次数。
   critic_warmup: 0
+  # 原理: 在 PPO 训练初期，价值函数（Critic）的估计可能非常不准。
+  # 设置一个预热期，让 Critic 先独立训练几步，得到一个相对靠谱的价值估计后，再开始用它来指导 Actor 的更新，有助于稳定训练。
 
   # Default path to distributed filesystem for saving checkpoints
+  # 保存检查点的默认分布式文件系统路径。
   default_hdfs_dir: null
 
   # Whether to delete local checkpoints after loading
+  # 加载后是否删除本地检查点。
   del_local_ckpt_after_load: False
 
   # Default local directory for saving checkpoints
+  # 保存检查点的默认本地目录。
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 
   # Maximum number of actor checkpoints to keep
+  # 最多保留的 Actor 检查点数量。
   max_actor_ckpt_to_keep: null
 
   # Maximum number of critic checkpoints to keep
+  # 最多保留的 Critic 检查点数量。
   max_critic_ckpt_to_keep: null
 
   # Timeout (in seconds) for Ray worker to wait for registration
+  # Ray 工作者等待注册的超时时间（秒）。
   ray_wait_register_center_timeout: 300
 
   # Device to run training on (e.g., "cuda", "cpu")
+  # 运行训练的设备。
   device: cuda
 
   # whether to use legacy worker implementation
   #  mode: "auto", "enable", or "disable"
+  # 是否使用旧版工作者实现。
   use_legacy_worker_impl: auto
 
-
 # profiler configs
+# profiler configs
+# 性能分析器配置
 global_profiler:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.utils.profiler.ProfilerConfig
 
   # Profiling tool: choose between nsys, npu, torch, torch_memory
+  # 性能分析工具：可选 nsys, npu, torch, torch_memory。
   tool: null
 
   # profile steps
+  # 要进行性能分析的训练步骤列表。
   steps: null
 
   # Whether to combine continuous steps into one database.
-  ## If True, worker.profiler.discrete must be False, [1,2] in one, [5] in another.
-  ## If False, [1] in one, [2] in another, [5] in another.
+  # 是否将连续的步骤合并到一个数据库中。
   profile_continuous_steps: False
+  # 原理: 控制 nsys 等工具的输出文件。`true` 表示如果 steps 是 `[1, 2, 5]`，则 1 和 2 会在一个文件中，5 在另一个。`false` 则每个 step 一个文件。
 
   # Path to save profiling contents
+  # 保存性能分析内容的路径。
   save_path: "outputs/profile"
 
   # Specific tool configs, can use +profiler.tool_config.[tool].xxx to config
+  # 特定工具的配置。
   global_tool_config:
-  
+
     # nsys config
+    # nsys 配置
     nsys:
 
       # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
       _target_: verl.utils.profiler.config.NsightToolConfig
 
       # True for each task has its own database, False for all tasks in one training step share one database.
+      # `true` 表示每个任务有自己的数据库，`false` 表示同一步的所有任务共享一个数据库。
       discrete: False
 
       # controller Nvidia Nsight Systems Options. Must set when profile_steps is not None.
-      ## reference https://docs.nvidia.com/nsight-systems/UserGuide/index.html
-      ## reference https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html
+      # 控制器（Driver）的 Nvidia Nsight Systems 选项。
       controller_nsight_options:
 
         # Select the API(s) to be traced.
+        # 选择要追踪的 API。
         trace: "cuda,nvtx,cublas,ucx"
 
         # Track the GPU memory usage by CUDA kernels. Must be string type "true" or "false".
+        # 追踪 CUDA 内核的 GPU 显存使用情况。
         cuda-memory-usage: "true"
 
         # CUDA graphs will be traced as a whole
+        # 将 CUDA graphs 作为一个整体进行追踪。
         cuda-graph-trace: "graph"
 
       # worker Nvidia Nsight Systems Options. Must set when profile_steps is not None.
+      # 工作者（Worker）的 Nvidia Nsight Systems 选项。
       worker_nsight_options:
 
         # Select the API(s) to be traced.
@@ -325,45 +458,55 @@ global_profiler:
         cuda-graph-trace: "graph"
 
         # Profiling only in a range of torch.cuda.profiler.start and stop. Do not change this config.
+        # 仅在 `torch.cuda.profiler.start` 和 `stop` 之间进行分析。请勿更改此配置。
         capture-range: "cudaProfilerApi"
 
         # Specify the desired behavior when a capture range ends.
-        # In verl we need the torch.cuda.profiler.start/stop pair to repeats n times.
-        # valid values are "repeat-shutdown:n" or null.
-        # For normal whole step profiling, n = len(profile_steps);
-        # but for discrete profiling, n = len(profile_steps) * Number(subtasks).
-        # Or you can just leave it null and the program will use n = len(profile_steps) * 6;
+        # 指定捕获范围结束时的行为。
         capture-range-end: null
 
         # Send signal to the target application's process group. We let the program to exit by itself.
+        # 向目标应用进程组发送信号。我们让程序自行退出。
         kill: none
 
     # enable memory visualization for debugging memory usage
+    # 启用内存可视化以调试显存使用。
     torch_memory:
 
       #  Maximum number of allocation entries to record
+      # 记录的最大分配条目数。
       trace_alloc_max_entries: 100_000
 
       # The depth of the call stack to capture for each allocation
+      # 为每次分配捕获的调用栈深度。
       stack_depth: 32
 
       # 'alloc': records only allocation events || 'state': records memory state changes || 'all': records both.
+      # 'alloc': 仅记录分配事件；'state': 记录内存状态变化；'all': 记录两者。
       context: "all"
 
       # 'python': records Python stacks || 'cpp': records C++ stacks (available in some versions) || 'all': records both.
+      # 'python': 记录 Python 栈；'cpp': 记录 C++ 栈；'all': 记录两者。
       stacks: "all"
 
       # devices, record_context etc.
+      # 其他 kw_args 参数，如 devices, record_context 等。
       kw_args: {}
-  
 # configs related to ray
+# configs related to ray
+# 与 Ray 相关的配置
 ray_kwargs:
 
   # configs related to ray initialization
+  # 与 Ray 初始化相关的配置
   ray_init:
-  
+
     # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
+    # Ray 使用的 CPU 数量。在使用 SLURM 时，建议使用固定数值而不是 null。
     num_cpus: null
 
   # Path to save Ray timeline JSON for performance profiling
+  # 保存 Ray 时间线 JSON 文件以进行性能分析的路径。
   timeline_json_file: null
+  # 原理: Ray timeline 会记录 Ray 中所有任务和 Actor 的调度、执行、开始和结束时间，
+  # 生成一个可以加载到 `chrome://tracing` 中进行可视化的 JSON 文件，非常适合用于诊断分布式系统中的性能瓶颈。

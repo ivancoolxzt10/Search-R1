@@ -13,49 +13,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
+# saver.py 主要用于分布式训练环境下的模型参数保存和层映射。
+# 包含全局 rank 计算、层映射、参数合并等，注释详细说明分布式并行的实现原理。
 
-import torch
-import torch.distributed as dist
-from megatron.core import mpu
-from megatron.core.distributed import DistributedDataParallel as LocalDDP
-from megatron.core.transformer.module import Float16Module
-from torch.nn.parallel import DistributedDataParallel as torchDDP
-
-from verl.utils.device import get_device_id, get_torch_device
-from verl.utils.logger import print_rank_0
-from verl.utils.megatron_utils import unwrap_model
+import time  # 用于计时分析性能
+import torch  # PyTorch 深度学习框架
+import torch.distributed as dist  # 分布式训练相关模块
+from megatron.core import mpu  # Megatron 并行工具
+from megatron.core.distributed import DistributedDataParallel as LocalDDP  # Megatron 分布式包装器
+from megatron.core.transformer.module import Float16Module  # Megatron 半精度模块
+from torch.nn.parallel import DistributedDataParallel as torchDDP  # PyTorch 分布式包装器
+from verl.utils.device import get_device_id, get_torch_device  # 设备相关工具函数
+from verl.utils.logger import print_rank_0  # 日志工具
+from verl.utils.megatron_utils import unwrap_model  # 解包工具
 
 
 def _megatron_calc_global_rank(
     tp_rank: int = 0, dp_rank: int = 0, pp_rank: int = 0, cp_rank: int = 0, ep_rank: int = 0
 ):
-    """Calculate global rank with support for CP/EP parallelism"""
-
-    # Get parallel sizes for each dimension
+    """
+    计算全局 rank，支持 CP/EP 并行。
+    参数:
+        tp_rank, dp_rank, pp_rank, cp_rank, ep_rank: 各并行维度的 rank
+    返回:
+        int: 全局 rank
+    """
+    # 获取各维度的并行规模
     tp_size = mpu.get_tensor_model_parallel_world_size()
     dp_size = mpu.get_data_parallel_world_size()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
     # ep_size = mpu.get_expert_model_parallel_world_size()
 
-    # Verify total GPU count matches (must be consistent with parallel_state.py)
+    # 校验总 GPU 数量是否一致
     total_size = tp_size * dp_size * pp_size * cp_size
     assert total_size == torch.distributed.get_world_size(), (
         f"{tp_size}x{dp_size}x{pp_size}x{cp_size} != {torch.distributed.get_world_size()}"
     )
 
-    # Core calculation logic (corresponds to RankGenerator order parameter)
-    # Assumes default order is "tp-cp-ep-dp-pp"
+    # 按照 RankGenerator 的顺序计算全局 rank，默认顺序为 "tp-cp-ep-dp-pp"
     return ((pp_rank * dp_size + dp_rank) * cp_size + cp_rank) * tp_size + tp_rank
 
 
 def _megatron_calc_layer_map(config):
-    """Calculate the mapping of global layer_idx to local layer_idx
-    Returns:
-        layer_map (Dict: int -> tuple(int, int, int)):
-            mapping from the global layer index to
-            a tuple of (pp_rank, virtual_pp_rank, layer_idx inside model)
+    """
+    计算全局层索引到本地层索引的映射。
+    参数:
+        config: 包含模型层数等配置参数
+    返回:
+        layer_map (Dict[int, tuple(int, int, int)]):
+            映射全局层索引到 (pp_rank, virtual_pp_rank, 层索引)
     """
     from megatron.core import mpu
 
@@ -81,24 +88,22 @@ def _megatron_calc_layer_map(config):
 
 
 def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False):
-    """Merge sharded parameters of a Megatron module into a merged checkpoint.
-
-    Args:
-        wrapped_models (list of megatron.core.distributed.DistributedDataParallel):
-            The local DDP wrapped megatron modules.
-        config (str or None):
-            HF config for model
-        dtype: model params type
-        is_value_model: if model is value model
-        tie_word_embeddings: tie_word_embeddings
-    Returns:
-        state_dict (dict):
-            The merged state_dict in rank 0, and an empty dictionary in other ranks.
     """
-    start_time = time.time()
+    合并分布式 Megatron 模型的参数，生成合并后的 checkpoint。
+    参数:
+        wrapped_models: 分布式包装的模型列表
+        config: HF 配置
+        dtype: 参数类型
+        is_value_model: 是否为 value model
+        tie_word_embeddings: 是否绑定词嵌入
+    返回:
+        state_dict (dict): rank 0 返回合并后的参数字典，其它 rank 返回空字典。
+    """
+    start_time = time.time()  # 记录合并开始时间
 
     def _get_gpt_model(model):
-        return model
+        # 获取 GPT 模型本体
+        return unwrap_model(model, (torchDDP, LocalDDP, Float16Module))
 
     dp_rank = mpu.get_data_parallel_rank()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -400,98 +405,4 @@ def merge_megatron_ckpt_gptmodel(wrapped_models, config, dtype, is_value_model=F
                 src_pp_rank=src_pp_rank,
             )
 
-            if gpt_model_module.config.add_qkv_bias:
-                _broadcast_tp_shard_tensor_qkv(
-                    sync_layer.self_attention.linear_qkv.bias,
-                    f"{layer_name}.self_attn.q_proj.bias",
-                    f"{layer_name}.self_attn.k_proj.bias",
-                    f"{layer_name}.self_attn.v_proj.bias",
-                    src_pp_rank=src_pp_rank,
-                )
-
-            _broadcast_tp_shard_tensor(
-                sync_layer.self_attention.linear_proj.weight,
-                f"{layer_name}.self_attn.o_proj.weight",
-                concat_dim=1,
-                src_pp_rank=src_pp_rank,
-            )
-
-            _broadcast_tensor(
-                sync_layer.mlp.linear_fc1.layer_norm_weight,
-                f"{layer_name}.post_attention_layernorm.weight",
-                src_pp_rank=src_pp_rank,
-            )
-
-            _broadcast_tp_shard_tensor_gate_up(
-                sync_layer.mlp.linear_fc1.weight,
-                f"{layer_name}.mlp.gate_proj.weight",
-                f"{layer_name}.mlp.up_proj.weight",
-                src_pp_rank=src_pp_rank,
-            )
-
-            _broadcast_tp_shard_tensor(
-                sync_layer.mlp.linear_fc2.weight,
-                f"{layer_name}.mlp.down_proj.weight",
-                concat_dim=1,
-                src_pp_rank=src_pp_rank,
-            )
-
-        # Final Layernorm
-        # -------------------
-        print_rank_0("collecting final layernorm...")
-        gpt_model_module = _get_gpt_model(models[-1])
-        _broadcast_tensor(
-            getattr(gpt_model_module.decoder.final_layernorm, "weight", None),
-            "model.norm.weight",
-            src_pp_rank=pp_size - 1,
-        )
-
-        if tie_word_embeddings:
-            print_rank_0("tie word embedding skip load lm_head...")
-        else:
-            print_rank_0("collecting lm_head...")
-
-            if is_value_model:
-                lm_head_weight = None
-                if pp_rank == pp_size - 1:
-                    lm_head_weight = getattr(gpt_model_module.output_layer, "weight", None)
-                _broadcast_tensor(lm_head_weight, "lm_head.weight", src_pp_rank=pp_size - 1)
-
-            else:
-                _broadcast_tp_shard_tensor(
-                    getattr(gpt_model_module.output_layer, "weight", None) if pp_rank == pp_size - 1 else None,
-                    "lm_head.weight",
-                    src_pp_rank=pp_size - 1,
-                )
-
-    dist.barrier()
-    get_torch_device().empty_cache()
-    if torch.distributed.get_rank() == 0:
-        for k, v in state_dict.items():
-            if dtype != v.dtype:
-                state_dict[k] = v.to(dtype)
-
-    print_rank_0(f"merge megatron ckpt done, time elapsed {time.time() - start_time}s")
-    return state_dict
-
-
-def merge_megatron_ckpt_gptmodel_qwen_moe(
-    wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
-):
-    raise NotImplementedError("merge_megatron_ckpt_gptmodel_qwen_moe is not implemented")
-
-
-def merge_megatron_ckpt_gptmodel_qwen2_5_vl(
-    wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
-):
-    raise NotImplementedError("merge_megatron_ckpt_gptmodel_qwen2_5_vl is not implemented")
-
-
-def merge_megatron_ckpt_gptmodel_dpskv3(wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False):
-    raise NotImplementedError("merge_megatron_ckpt_gptmodel_dpskv3 is not implemented")
-
-
-def merge_megatron_ckpt_gptmodel_mixtral(
-    wrapped_models, config, dtype, is_value_model=False, tie_word_embeddings=False
-):
-    raise NotImplementedError("merge_megatron_ckpt_gptmodel_mixtral is not implemented")
+            if gpt_model_module.config.add_qk

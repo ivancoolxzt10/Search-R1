@@ -1,60 +1,70 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
+# 版权声明，表明该文件归 Bytedance 所有
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
+# 按照 Apache 2.0 协议授权
 # you may not use this file except in compliance with the License.
+# 只有遵循协议才能使用本文件
 # You may obtain a copy of the License at
+# 可在以下网址获取协议全文
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+# 协议网址
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
+# 本文件按“原样”分发
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# 不提供任何明示或暗示的担保
 # See the License for the specific language governing permissions and
+# 具体权限请查阅协议
 # limitations under the License.
+# 协议中的限制条款
 
-import json
-import os
-import warnings
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Callable, ContextManager
+import json  # JSON 处理模块
+import os    # 操作系统相关模块
+import warnings  # 警告处理模块
+from contextlib import contextmanager  # 上下文管理器
+from pathlib import Path  # 路径处理工具
+from typing import Any, Callable, ContextManager  # 类型注解
 
-import numpy as np
-import torch
-import torch.distributed as dist
-from accelerate import init_empty_weights
-from megatron.core import mpu
-from megatron.core.models.gpt.gpt_model import ModelType
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from safetensors.torch import load_file
+import numpy as np  # 数组库
+import torch  # 深度学习库
+import torch.distributed as dist  # 分布式训练工具
+from accelerate import init_empty_weights  # HuggingFace 加速库
+from megatron.core import mpu  # Megatron 并行工具
+from megatron.core.models.gpt.gpt_model import ModelType  # Megatron GPT 模型类型
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # 并行随机种子
+from safetensors.torch import load_file  # safetensors 权重加载
 from transformers import (
     AutoConfig,
     PretrainedConfig,
-)
+)  # transformers 配置
 
-from verl.models.mcore import hf_to_mcore_config
-from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
-from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing
-from verl.utils.megatron_utils import get_model
-from verl.utils.tokenizer import hf_processor, hf_tokenizer
+from verl.models.mcore import hf_to_mcore_config  # HuggingFace 到 mcore 配置转换
+from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device  # 设备工具
+from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing  # Megatron 分布式 checkpoint 加载
+from verl.utils.megatron_utils import get_model  # Megatron 模型获取工具
+from verl.utils.tokenizer import hf_processor, hf_tokenizer  # huggingface 工具
 
-from .base_model_merger import BaseModelMerger, ModelMergerConfig
+from .base_model_merger import BaseModelMerger, ModelMergerConfig  # 合并基类和配置
 
 
 @contextmanager
 def noop_context() -> Any:
+    """空上下文管理器，用于兼容部分流程。"""
     yield
 
 
 def get_dynamic_pipeline_shards(layer_num: int, pp_size: int) -> list[int]:
-    """Calculate the pipeline sharding configuration for Megatron-LM.
+    """计算 Megatron-LM 的 pipeline 分片配置。
 
     Args:
-        layer_num: Total number of layers in the model.
-        pp_size: Number of pipeline parallel ranks.
+        layer_num: 总层数
+        pp_size: pipeline 并行数
 
     Returns:
-        layer number of each pp rank. Make the sharding of the pipeline as uniform as possible.
+        每个 pp rank 的层数配置，尽量均匀
     """
     if layer_num < pp_size:
         raise ValueError(f"layer_num {layer_num} must be greater than pp_size {pp_size}.")
@@ -84,7 +94,7 @@ def get_dynamic_pipeline_shards(layer_num: int, pp_size: int) -> list[int]:
                 )
             )
 
-    # sort by diff of layer_num, to make it as uniform as possible
+    # 按分片层数差异排序，尽量均匀分片
     res = sorted(shards_strategy, key=lambda x: x[1])[0][0]
     assert sum(res) == layer_num, f"sum(res)={sum(res)} != layer_num={layer_num}, pp_size={pp_size}"
     return res
@@ -92,33 +102,32 @@ def get_dynamic_pipeline_shards(layer_num: int, pp_size: int) -> list[int]:
 
 class MegatronModelMerger(BaseModelMerger):
     """
-    Model merger for Megatron-LM distributed checkpoints.
+    Megatron-LM 分布式 checkpoint 合并器。
 
-    This class handles the conversion of Megatron-LM distributed checkpoints into HuggingFace format.
-    Megatron-LM uses tensor parallelism, pipeline parallelism, and data parallelism to distribute
-    large language models across multiple GPUs. This merger reconstructs the full model by
-    loading distributed checkpoints and applying the necessary transformations.
+    该类负责将 Megatron-LM 分布式 checkpoint 转换为 HuggingFace 格式。
+    Megatron-LM 使用张量并行、流水线并行和数据并行将大语言模型分布在多个 GPU 上。
+    此合并器通过加载分布式检查点并应用必要的转换来重建完整模型。
 
-    Key features:
-    - Support for tensor parallel, pipeline parallel, and data parallel configurations
-    - Automatic parameter name mapping from Megatron to HuggingFace conventions
-    - Handling of QKV and gate-up tensor splitting/merging
-    - Support for tied word embeddings and value models
-    - Integration with Megatron's distributed checkpointing system
+    主要功能：
+    - 支持张量并行、流水线并行和数据并行配置
+    - 自动参数名称映射从 Megatron 到 HuggingFace 约定
+    - 处理 QKV 和 gate-up 张量的分割/合并
+    - 支持绑定的词嵌入和价值模型
+    - 与 Megatron 的分布式检查点系统集成
 
-    The merger handles various model architectures and configurations:
-    - Standard transformer models (GPT-style)
-    - Models with tied word embeddings
-    - Value models for reinforcement learning
-    - Multi-layer attention (MLA) architectures
-    - Mixture of Experts (MoE) models
+    合并器处理各种模型架构和配置：
+    - 标准变压器模型（GPT 风格）
+    - 具有绑定词嵌入的模型
+    - 强化学习的价值模型
+    - 多层注意力（MLA）架构
+    - 专家混合（MoE）模型
 
     Args:
-        config (ModelMergerConfig): Configuration object with Megatron-specific settings
-            including tie_word_embedding and is_value_model flags.
+        config (ModelMergerConfig): 配置对象，包含 Megatron 特定设置
+            包括 tie_word_embedding和 is_value_model 标志。
 
-    Example:
-        To merge Megatron checkpoints:
+    示例:
+        要合并 Megatron 检查点：
         ```python
         config = ModelMergerConfig(
             operation="merge",
@@ -134,7 +143,7 @@ class MegatronModelMerger(BaseModelMerger):
 
     def __init__(self, config: ModelMergerConfig):
         super().__init__(config)
-        # Currently we use only 1 rank to merge the dist_ckpt, we will move to multi-process save shortly afterwards
+        # 仅用 1 个 rank 合并分布式 checkpoint，后续可扩展为多进程
         if "WORLD_SIZE" not in os.environ:
             os.environ["RANK"] = "0"
             os.environ["LOCAL_RANK"] = "0"
@@ -163,9 +172,8 @@ class MegatronModelMerger(BaseModelMerger):
         print(self.hf_config, flush=True)
 
         self.params_mapping = {
-            # megatron core gpt model name, huggingface model name
-            # NOTICE: It's a little bit tricky, when 2 keys have the same prefix, we need to make sure the
-            # longer key within the containing relationship is processed first.
+            # Megatron GPT 模型名与 HuggingFace 模型名映射
+            # 注意：当两个键具有相同前缀时，必须先处理包含关系较长的键。
             "embedding.word_embeddings": "model.embed_tokens",
             # input layer norm for dpskv3
             "input_layernorm.weight": "input_layernorm.weight",
@@ -210,16 +218,16 @@ class MegatronModelMerger(BaseModelMerger):
 
     def _load_state_dicts(self, model_ckpt_path: str) -> dict[str, Any]:
         """_summary_
-        Use Megatron dist_checkpointing to load the model state dicts from the checkpoint directory.
+        使用 Megatron dist_checkpointing 从检查点目录加载模型状态字典。
 
         Args:
-            model_ckpt_path (str): Path to the model checkpoint directory.
+            model_ckpt_path (str): 模型检查点目录路径。
 
         Returns:
-            State dict containing the model parameters.
+            包含模型参数的状态字典。
         """
 
-        # init hf config
+        # 初始化 hf config
         self.pipeline_shards = get_dynamic_pipeline_shards(self.hf_config.num_hidden_layers, self.world_size)
         print(f"Pipeline shards: {self.pipeline_shards}, total layers: {sum(self.pipeline_shards)}")
 
@@ -232,7 +240,7 @@ class MegatronModelMerger(BaseModelMerger):
         tf_config.use_cpu_initialization = self.config.use_cpu_initialization
         tie_word_embeddings = getattr(self.hf_config, "tie_word_embeddings", False)
 
-        # init megatron model
+        # 初始化 megatron 模型
         def megatron_model_provider(pre_process, post_process):
             from verl.models.mcore import init_mcore_model
 
@@ -258,10 +266,10 @@ class MegatronModelMerger(BaseModelMerger):
             )
 
         if self.config.use_cpu_initialization:
-            # convert meta device to empty tensor so it can use `copy_` function
+            # 将 meta 设备转换为空张量，以便使用 `copy_` 函数
             whole_model[0].module = whole_model[0].module.to_empty(device="cpu")
 
-        # load state dicts
+        # 加载状态字典
         sharded_state_dict = {}
         for vpp_rank, model in enumerate(whole_model):
             key = f"model{vpp_rank}" if len(whole_model) > 1 else "model"
@@ -278,10 +286,10 @@ class MegatronModelMerger(BaseModelMerger):
 
     def _check_megatron_state_key(self, key: str) -> bool:
         """
-        Checks if the key is a valid Megatron state key.
+        检查给定的 key 是否为有效的 Megatron 状态 key。
 
-        Now the model merger only supports keys that start with "decoder/embedding/output_layer" in TransformerLayer.
-        Shall not use key starts with "model."
+        目前合并器仅支持以 "decoder/embedding/output_layer" 开头的 TransformerLayer 中的键。
+        不应使用以 "model." 开头的键。
         """
         if key.startswith("model."):
             raise ValueError(
@@ -295,7 +303,7 @@ class MegatronModelMerger(BaseModelMerger):
                 print(f"skip checking key {key}")
                 return
 
-        # Exclude extra state keys
+        # 排除额外的状态键
         if not key.startswith("decoder"):
             raise ValueError(
                 f"Invalid key {key} in Megatron state_dict. Expected keys to start with 'decoder' in TransformerLayer."
@@ -305,11 +313,11 @@ class MegatronModelMerger(BaseModelMerger):
         self, key: str, tensor: torch.Tensor, config: PretrainedConfig, is_value_model: bool = False
     ) -> list[torch.Tensor]:
         """
-        Splits a tensor into multiple tensors based on the name.
-        This is used to handle qkv and gate_up tensors.
+        根据名称将张量拆分为多个张量。
+        用于处理 qkv 和 gate_up 张量。
         """
         if "linear_fc1.weight" in key:
-            # if the tensor is gate and proj
+            # 如果张量是 gate 和 proj
             gate_lst = []
             up_lst = []
             gate, up = tensor.chunk(2)
@@ -319,8 +327,8 @@ class MegatronModelMerger(BaseModelMerger):
             up = torch.cat(up_lst, dim=0)
             return [gate, up]
         elif "self_attention.linear_qkv." in key and "layer_norm" not in key:
-            # if the tensor is qkv, for each param on tp, split into q, k, v
-            # concat q, k, v separately.
+            # 如果张量是 qkv，对于每个 param 在 tp 上，拆分为 q、k、v
+            # 分别连接 q、k、v。
             q_lst, k_lst, v_lst = [], [], []
             assert config.num_attention_heads % config.num_key_value_heads == 0
             num_q_per_kv = config.num_attention_heads // config.num_key_value_heads
@@ -347,6 +355,10 @@ class MegatronModelMerger(BaseModelMerger):
             return [tensor]
 
     def _merge_state_dicts(self, model_state_dict_list: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        """
+        合并多个模型状态字典为一个字典。
+        对于每个模型状态字典，检查并转换键名，拆分张量，处理专家模型的特殊情况。
+        """
         state_dict = {}
         layers_cum = 0
         if self.world_size > 1:
@@ -394,11 +406,11 @@ class MegatronModelMerger(BaseModelMerger):
                 if len(split_tensor) == 1:
                     state_dict[hf_name] = split_tensor[0]
                 elif len(split_tensor) == 3:
-                    # split qkv
+                    # 拆分 qkv
                     for n, d in zip(["q", "k", "v"], split_tensor, strict=True):
                         state_dict[hf_name.replace("qkv", n)] = d
                 elif len(split_tensor) == 2:
-                    # split gate up
+                    # 拆分 gate up
                     state_dict[hf_name.replace("gate_up", "gate")] = split_tensor[0]
                     state_dict[hf_name.replace("gate_up", "up")] = split_tensor[1]
                 shape_info = (
@@ -406,11 +418,16 @@ class MegatronModelMerger(BaseModelMerger):
                 )
                 print(f"converted {key} to {hf_name} with shape {shape_info}")
 
-            layers_cum += layers_handled + 1  # zero based
+            layers_cum += layers_handled + 1  # 从零开始计数
 
         return state_dict
 
     def save_hf_model_and_tokenizer(self, merged_state_dict):
+        """
+        保存合并后的 HuggingFace 模型和分词器。
+        如果是单卡，则直接调用父类方法；
+        如果是多卡，则手动分片保存模型权重。
+        """
         if self.world_size == 1:
             return super().save_hf_model_and_tokenizer(merged_state_dict)
 
@@ -418,12 +435,12 @@ class MegatronModelMerger(BaseModelMerger):
 
         layer_num = self.hf_config.num_hidden_layers
 
-        # FIXME: make configurable
+        # FIXME: 可配置
         saves_per_layer = 1 if layer_num < 30 else 2
         saves_total = saves_per_layer * layer_num
         saves_indexes = {}
 
-        # calculate the layer start index and key chunks
+        # 计算每层起始索引和键的分片
         layer_this_rank = self.pipeline_shards[self.rank]
         pipeline_cumsum = np.cumsum(self.pipeline_shards)
         layer_start = 0 if self.rank == 0 else pipeline_cumsum[self.rank - 1]
@@ -435,7 +452,7 @@ class MegatronModelMerger(BaseModelMerger):
             f"Expected {len(keys_chunk)} chunks, but got {layer_this_rank * saves_per_layer} for rank {self.rank}."
         )
 
-        # save to model shards manually
+        # 手动保存模型分片
         target_dir = Path(self.config.target_dir)
         for i, keys in enumerate(keys_chunk):
             sd_to_save = {k: merged_state_dict[k] for k in keys}
@@ -480,6 +497,14 @@ class MegatronModelMerger(BaseModelMerger):
                 tokenizer.save_pretrained(self.config.target_dir)
 
     def merge_and_save(self):
+        """
+        主合并与保存流程：
+        1. 获取分布式检查点路径
+        2. 加载状态字典
+        3. 合并状态字典
+        4. 保存 HuggingFace 模型和分词器
+        5. 可选：上传到 HuggingFace Hub
+        """
         from verl.utils.megatron_utils import get_dist_checkpoint_path
 
         model_ckpt_path = get_dist_checkpoint_path(self.config.local_dir)
@@ -501,8 +526,8 @@ class MegatronModelMerger(BaseModelMerger):
 
     def _validate_state_dict(self, state_dict: dict[str, torch.Tensor]):
         """
-        Compares the merged Megatron state_dict against a reference safetensors model.
-        Applies necessary name mappings from Megatron to Hugging Face conventions using _replace_name.
+        将合并后的 Megatron 状态字典与参考 safetensors 模型进行比较。
+        应用必要的名称映射从 Megatron 到 Hugging Face 的约定使用 _replace_name。
         """
         ref_state_dict = load_file(Path(self.config.test_hf_dir) / "model.safetensors")
 
@@ -522,6 +547,9 @@ class MegatronModelMerger(BaseModelMerger):
             torch.testing.assert_close(loaded_weight.to("cpu"), param, atol=1e-2, rtol=5e-2)
 
     def _replace_name(self, megatron_name: str, name_mapping: dict[str, str]) -> str:
+        """
+        根据名称映射字典转换 Megatron 模型的参数名称为 HuggingFace 约定。
+        """
         for m_name, v_name in name_mapping.items():
             if m_name not in megatron_name:
                 continue
@@ -531,7 +559,10 @@ class MegatronModelMerger(BaseModelMerger):
 
             return param_name
 
-        return None  # Return None if no mapping found
+        return None  # 如果没有找到映射，则返回 None
 
     def cleanup(self):
+        """
+        清理过程，销毁进程组。
+        """
         torch.distributed.destroy_process_group()

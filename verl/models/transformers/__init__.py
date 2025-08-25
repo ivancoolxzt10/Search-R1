@@ -11,3 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# transformers 包初始化文件，仅用于包导入和版权声明，无实际代码实现。
+# 说明：本文件用于声明 transformers 包的合法性和初始化，实际功能代码在子模块中实现。

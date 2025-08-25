@@ -1,3 +1,7 @@
+# 初学者备注：
+# 本文件为 checkpoint_utils 包的初始化文件，主要用于包的导入和版权声明。
+# 通常无需修改或直接使用。
+
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

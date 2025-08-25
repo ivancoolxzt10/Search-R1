@@ -1,3 +1,16 @@
+"""
+agent_loop.py
+
+本文件主要实现了 Agent Loop 的核心逻辑，包括：
+- 多服务器负载均衡与粘性会话管理（AsyncLLMServerManager）
+- Agent Loop 的输入输出结构定义
+- Agent Loop 的注册与实例化机制
+- 奖励管理器与 Agent Loop 工作线程的异步分布式处理
+- Agent Loop 管理器，负责批量分发与性能统计
+
+适合初学者了解分布式 LLM 推理与 RL 训练的整体流程。
+"""
+
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,73 +24,75 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
-import heapq
-import logging
-import os
-import random
-from abc import ABC, abstractmethod
-from typing import Any, Optional
+import asyncio  # 异步编程模块
+import heapq    # 堆队列模块，用于负载均衡
+import logging  # 日志模块
+import os       # 操作系统相关模块
+import random   # 随机数模块
+from abc import ABC, abstractmethod  # 抽象基类和抽象方法
+from typing import Any, Optional    # 类型注解
 
-import hydra
-import numpy as np
-import ray
-import torch
-from cachetools import LRUCache
-from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, ConfigDict
-from tensordict import TensorDict
-from transformers import AutoProcessor, AutoTokenizer
+import hydra  # 配置管理库
+import numpy as np  # 数组库
+import ray  # 分布式计算框架
+import torch  # 深度学习库
+from cachetools import LRUCache  # LRU 缓存工具
+from omegaconf import DictConfig, OmegaConf  # 配置管理库
+from pydantic import BaseModel, ConfigDict  # 数据校验库
+from tensordict import TensorDict  # 张量字典工具
+from transformers import AutoProcessor, AutoTokenizer  # transformers 库的自动处理器和分词器
 
-from verl.protocol import DataProto
-from verl.single_controller.ray.base import RayWorkerGroup
-from verl.trainer.ppo.reward import load_reward_manager
-from verl.utils import hf_processor, hf_tokenizer
-from verl.utils.fs import copy_to_local
-from verl.utils.model import compute_position_id_with_mask
-from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
-from verl.workers.rollout.async_server import TokenOutput, async_server_class
+from verl.protocol import DataProto  # verl 协议相关的数据结构
+from verl.single_controller.ray.base import RayWorkerGroup  # ray worker 组管理类
+from verl.trainer.ppo.reward import load_reward_manager  # PPO 奖励管理器加载函数
+from verl.utils import hf_processor, hf_tokenizer  # huggingface 处理器和分词器工具
+from verl.utils.fs import copy_to_local  # 文件系统工具函数
+from verl.utils.model import compute_position_id_with_mask  # 模型相关工具函数
+from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op  # rollout trace 相关工具和装饰器
+from verl.workers.rollout.async_server import TokenOutput, async_server_class  # 异步服务相关类和输出结构
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger = logging.getLogger(__file__)  # 获取当前文件的日志记录器
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))  # 设置日志级别，默认 WARN，可通过环境变量修改
 
 
 class AsyncLLMServerManager:
     """
-    A class to manage multiple OpenAI compatible LLM servers. This class provides
-    - Load balance: least requests load balancing
-    - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
+    管理多个 OpenAI 兼容的 LLM 服务器的类。
+    主要功能：
+    - 负载均衡：最少请求负载均衡
+    - 粘性会话：多轮对话发送到同一服务器，实现自动前缀缓存
     """
 
     def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
-        """Initialize the AsyncLLMServerManager.
+        """初始化 AsyncLLMServerManager。
 
-        Args:
-            config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
-            max_cache_size (int, optional): max cache size for request_id to server mapping. Defaults to 10000.
+        参数:
+            config (DictConfig): YAML 配置文件
+            server_handles (List[ray.actor.ActorHandle]): OpenAI 兼容的 LLM 服务器 actor 句柄列表
+            max_cache_size (int, optional): request_id 到服务器映射的最大缓存数，默认 10000
         """
-        self.config = config
-        self.server_handles = server_handles
-        random.shuffle(self.server_handles)
+        self.config = config  # 保存配置
+        self.server_handles = server_handles  # 保存服务器句柄列表
+        random.shuffle(self.server_handles)  # 随机打乱服务器列表，避免总是选第一个
 
-        # Least requests load balancing
-        self.weighted_serveres = [[0, (hash(server), server)] for server in server_handles]
-        heapq.heapify(self.weighted_serveres)
+        # 最少请求负载均衡
+        self.weighted_serveres = [[0, (hash(server), server)] for server in server_handles]  # 创建一个带权重的服务器列表，初始权重为 0
+        heapq.heapify(self.weighted_serveres)  # 转为堆队列，方便负载均衡
 
-        # LRU cache to map request_id to server
-        self.request_id_to_server = LRUCache(maxsize=max_cache_size)
+        # LRU 缓存，用于 request_id 到服务器的映射
+        self.request_id_to_server = LRUCache(maxsize=max_cache_size)  # 创建 LRU 缓存，最大容量 max_cache_size
 
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
-        # TODO: implement server pressure awareness load balancing
+        # TODO: 实现服务器压力感知的负载均衡
         if request_id in self.request_id_to_server:
+            # 如果 request_id 已有映射，直接返回对应服务器
             return self.request_id_to_server[request_id]
 
-        server = self.weighted_serveres[0][1][1]
-        self.weighted_serveres[0][0] += 1
-        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
-        self.request_id_to_server[request_id] = server
-        return server
+        server = self.weighted_serveres[0][1][1]  # 选择权重最小的服务器
+        self.weighted_serveres[0][0] += 1  # 增加该服务器的权重
+        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])  # 更新堆队列
+        self.request_id_to_server[request_id] = server  # 将 request_id 映射到该服务器
+        return server  # 返回选中的服务器
 
     @rollout_trace_op
     async def generate(
@@ -88,88 +103,72 @@ class AsyncLLMServerManager:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
-        """Generate tokens from prompt ids.
+        """根据 prompt ids 生成 token。
 
-        Args:
-            request_id (str): request id for sticky session.
-            prompt_ids (List[int]): List of prompt token ids.
-            sampling_params (Dict[str, Any]): Sampling parameters for the chat completion.
+        参数:
+            request_id (str): 用于粘性会话的请求 id
+            prompt_ids (List[int]): prompt 的 token id 列表
+            sampling_params (Dict[str, Any]): 采样参数
+            image_data (Optional[List[Any]]): 可选的图片数据
 
-        Returns:
-            TokenOutput: token output
+        返回:
+            TokenOutput: 生成的 token 输出
         """
-        server = self._choose_server(request_id)
+        server = self._choose_server(request_id)  # 选择服务器
         output = await server.generate.remote(
             request_id=request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
-        )
-        return output
+        )  # 异步调用服务器生成 token
+        return output  # 返回生成结果
 
 
 class AgentLoopMetrics(BaseModel):
-    """Agent loop performance metrics."""
+    """Agent loop 性能指标类。"""
 
-    generate_sequences: float = 0.0
-    tool_calls: float = 0.0
+    generate_sequences: float = 0.0  # 生成序列的耗时
+    tool_calls: float = 0.0  # 工具调用的耗时
 
 
 class AgentLoopOutput(BaseModel):
-    """Agent loop output."""
+    """Agent loop 输出结构。"""
 
-    prompt_ids: list[int]
-    """Prompt token ids."""
-    response_ids: list[int]
-    """Response token ids including LLM generated token, tool response token."""
-    response_mask: list[int]
-    """Response mask, 1 for LLM generated token, 0 for tool response token."""
-    response_logprobs: Optional[list[float]] = None
-    """Log probabilities for the response tokens."""
-    multi_modal_data: Optional[dict[str, Any]] = None
-    """Multi-modal data for multi-modal tools."""
-    reward_score: Optional[float] = None
-    """Reward score for the trajectory."""
-    num_turns: int = 0
-    """Number of chat turns, including user, assistant, tool."""
-    metrics: AgentLoopMetrics
-    """Auxiliary performance metrics"""
+    prompt_ids: list[int]  # prompt 的 token id 列表
+    response_ids: list[int]  # response 的 token id，包括 LLM 生成和工具响应
+    response_mask: list[int]  # response mask，1 表示 LLM 生成，0 表示工具响应
+    response_logprobs: Optional[list[float]] = None  # response token 的 log 概率
+    multi_modal_data: Optional[dict[str, Any]] = None  # 多模态工具的数据
+    reward_score: Optional[float] = None  # 轨迹的奖励分数
+    num_turns: int = 0  # 对话轮数，包括用户、助手、工具
+    metrics: AgentLoopMetrics  # 辅助性能指标
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
-    """Internal agent loop output with padded sequences."""
+    """带有填充序列的内部 Agent loop 输出结构。"""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True)  # 允许任意类型
 
-    prompt_ids: torch.Tensor
-    """Padded prompt token ids."""
-    response_ids: torch.Tensor
-    """Padded response token ids."""
-    input_ids: torch.Tensor
-    """Padded input ids(prompt_ids + response_ids)."""
-    position_ids: torch.Tensor
-    """Padded position ids."""
-    response_mask: torch.Tensor
-    """Padded response mask."""
-    attention_mask: torch.Tensor
-    """Padded attention mask."""
-    response_logprobs: Optional[torch.Tensor] = None
-    """Padded log probabilities for the response tokens."""
-    multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
-    """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
+    prompt_ids: torch.Tensor  # 填充后的 prompt token id
+    response_ids: torch.Tensor  # 填充后的 response token id
+    input_ids: torch.Tensor  # 填充后的输入 id（prompt + response）
+    position_ids: torch.Tensor  # 填充后的位置 id
+    response_mask: torch.Tensor  # 填充后的 response mask
+    attention_mask: torch.Tensor  # 填充后的 attention mask
+    response_logprobs: Optional[torch.Tensor] = None  # 填充后的 log 概率
+    multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None  # 多模态输入（如图片张量）
 
 
-# make hydra.utils.instantiate happy
+# 让 hydra.utils.instantiate 能正常工作
 class _DummyConfig:
     def __init__(self, config: DictConfig) -> None:
-        self.config = config
+        self.config = config  # 保存配置
 
 
 class AgentLoopBase(ABC):
-    """An agent loop takes a input message, chat with OpenAI compatible LLM server and interact with various
-    environments."""
+    """Agent loop 基类，负责与 OpenAI 兼容的 LLM 服务器和环境交互。"""
 
-    _class_initialized = False
+    _class_initialized = False  # 类初始化标志
 
     def __init__(
         self,
@@ -179,45 +178,45 @@ class AgentLoopBase(ABC):
         processor: AutoProcessor,
         **kwargs,
     ):
-        """Initialize agent loop, each sample will have its own loop instance.
+        """初始化 agent loop，每个样本有自己的 loop 实例。
 
-        Args:
-            trainer_config (_DummyConfig): trainer config.
-            server_manager (AsyncLLMServerManager): OpenAI compatible LLM server manager.
-            tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
-            processor (AutoProcessor): Processor for process messages.
+        参数:
+            trainer_config (_DummyConfig): 训练器配置
+            server_manager (AsyncLLMServerManager): LLM 服务器管理器
+            tokenizer (AutoTokenizer): 分词器
+            processor (AutoProcessor): 处理器
         """
-        self.init_class(config=trainer_config.config, tokenizer=tokenizer, processor=processor, **kwargs)
-        self.config = trainer_config.config
-        self.server_manager = server_manager
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.loop = asyncio.get_running_loop()
+        self.init_class(config=trainer_config.config, tokenizer=tokenizer, processor=processor, **kwargs)  # 类级初始化
+        self.config = trainer_config.config  # 保存配置
+        self.server_manager = server_manager  # 保存服务器管理器
+        self.tokenizer = tokenizer  # 保存分词器
+        self.processor = processor  # 保存处理器
+        self.loop = asyncio.get_running_loop()  # 获取当前异步事件循环
 
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, processor: AutoProcessor, **kwargs):
-        """This is used to do heavy initialization work that should shared across all instances. It's only called once.
+        """用于做只需一次的重初始化工作，所有实例共享。
 
-        Args:
-            config (DictConfig): trainer config.
-            tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
-            processor (AutoProcessor): Processor for process multi_modal data.
-            **kwargs: extra kwargs from config file passed in by `hydra.utils.instantiate`.
+        参数:
+            config (DictConfig): 训练器配置
+            tokenizer (AutoTokenizer): 分词器
+            processor (AutoProcessor): 处理器
+            **kwargs: 其他配置参数
         """
         if cls._class_initialized:
-            return
-        cls._class_initialized = True
+            return  # 如果已经初始化过，直接返回
+        cls._class_initialized = True  # 标记为已初始化
 
     @abstractmethod
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        """Run agent loop to interact with LLM server and environment.
+        """运行 agent loop，与 LLM 服务器和环境交互。
 
-        Args:
-            sampling_params (Dict[str, Any]): LLM sampling params.
-            **kwargs: dataset fields from `verl.utils.dataset.RLHFDataset`.
+        参数:
+            sampling_params (Dict[str, Any]): LLM 采样参数
+            **kwargs: 数据集字段
 
-        Returns:
-            AgentLoopOutput: Agent loop output.
+        返回:
+            AgentLoopOutput: Agent loop 输出
         """
         raise NotImplementedError
 
@@ -231,11 +230,15 @@ _agent_loop_registry: dict[str, dict] = {}
 
 
 def register(agent_name: str):
-    """Register agent loop class."""
+    """注册 agent loop 类。
+
+    参数:
+        agent_name (str): agent 名称
+    """
 
     def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
         fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
-        _agent_loop_registry[agent_name] = {"_target_": fqdn}
+        _agent_loop_registry[agent_name] = {"_target_": fqdn}  # 将 agent 名称和类的完全限定名注册到字典
         return subclass
 
     return decorator
@@ -243,31 +246,30 @@ def register(agent_name: str):
 
 @ray.remote(num_cpus=1)
 class RewardManagerWorker:
-    """Reward manager worker to compute reward score asynchronously to overlap with agent loop."""
+    """奖励管理器工作线程，异步计算奖励分数，与 agent loop 重叠执行。"""
 
     def __init__(self, config: DictConfig, local_path: str) -> None:
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=True)  # 加载分词器
         self.reward_manager = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        self.loop = asyncio.get_event_loop()
+        )  # 加载奖励管理器
+        self.loop = asyncio.get_event_loop()  # 获取事件循环
 
     async def compute_score(self, output: AgentLoopOutput, kwargs: dict) -> float:
-        """Compute reward score for agent loop output.
+        """计算 agent loop 输出的奖励分数。
 
-        NOTE: Since `reward_manager.__call__` is blocking function, we run it in thread pool to
-        compute multiple samples in parallel.
+        注意：由于 `reward_manager.__call__` 是阻塞函数，因此在线程池中运行它，以便并行计算多个样本。
 
-        Args:
-            output (AgentLoopOutput): Agent loop output.
-            kwargs (dict): Dataset fields from `verl.utils.dataset.RLHFDataset`.
+        参数:
+            output (AgentLoopOutput): Agent loop 输出
+            kwargs (dict): 数据集字段
 
-        Returns:
-            float: Reward score.
+        返回:
+            float: 奖励分数
         """
-        prompts = torch.tensor(output.prompt_ids, dtype=torch.long).unsqueeze(0)
-        responses = torch.tensor(output.response_ids, dtype=torch.long).unsqueeze(0)
-        attention_mask = torch.ones((1, prompts.shape[1] + responses.shape[1]), dtype=torch.long)
+        prompts = torch.tensor(output.prompt_ids, dtype=torch.long).unsqueeze(0)  # 转为张量并增加一个维度
+        responses = torch.tensor(output.response_ids, dtype=torch.long).unsqueeze(0)  # 转为张量并增加一个维度
+        attention_mask = torch.ones((1, prompts.shape[1] + responses.shape[1]), dtype=torch.long)  # 全 1 的 attention mask
         batch = TensorDict(
             {
                 "prompts": prompts,  # [1, prompt_length]
@@ -288,36 +290,37 @@ class RewardManagerWorker:
             None,
             self.reward_manager,
             data,
-        )
-        return reward_tensor.sum(dim=-1).item()
+        )  # 在线程池中运行奖励管理器
+        return reward_tensor.sum(dim=-1).item()  # 返回奖励分数
 
 
 @ray.remote
 class AgentLoopWorker:
-    """Agent loop worker takes a batch of messages and run each message in an agent loop."""
+    """Agent loop 工作线程，处理一批消息并在 agent loop 中运行每个消息。"""
 
     def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle]):
-        """Initialize agent loop manager.
+        """初始化 agent loop 管理器。
 
-        Args:
-            config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+        参数:
+            config (DictConfig): YAML 配置
+            server_handles (List[ray.actor.ActorHandle]): OpenAI 兼容的 LLM 服务器 actor 句柄列表
         """
-        self.config = config
-        self.server_manager = AsyncLLMServerManager(config, server_handles)
+        self.config = config  # 保存配置
+        self.server_manager = AsyncLLMServerManager(config, server_handles)  # 初始化服务器管理器
 
-        model_path = config.actor_rollout_ref.model.path
-        self.model_name = "/".join(model_path.split("/")[-2:])
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
-        self.processor = hf_processor(local_path, trust_remote_code=True)
+        model_path = config.actor_rollout_ref.model.path  # 模型路径
+        self.model_name = "/".join(model_path.split("/")[-2:])  # 模型名称
+        local_path = copy_to_local(config.actor_rollout_ref.model.path)  # 复制模型到本地
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)  # 加载分词器
+        self.processor = hf_processor(local_path, trust_remote_code=True)  # 加载处理器
 
-        agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
+        agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path  # agent loop 配置路径
         if agent_loop_config_path:
-            agent_loop_configs = OmegaConf.load(agent_loop_config_path)
+            agent_loop_configs = OmegaConf.load(agent_loop_config_path)  # 加载 agent loop 配置
             for agent_loop_config in agent_loop_configs:
-                _agent_loop_registry[agent_loop_config.name] = agent_loop_config
+                _agent_loop_registry[agent_loop_config.name] = agent_loop_config  # 注册 agent loop 配置
         if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
+            # 如果有自定义聊天模板，设置分词器和处理器的聊天模板
             if self.processor is not None:
                 self.processor.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
             self.tokenizer.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
@@ -327,7 +330,7 @@ class AgentLoopWorker:
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False,
             ),
-        ).remote(self.config, local_path)
+        ).remote(self.config, local_path)  # 初始化奖励管理器工作线程
 
         trace_config = self.config.actor_rollout_ref.rollout.get("trace", {})
         RolloutTraceConfig.init(
@@ -335,28 +338,16 @@ class AgentLoopWorker:
             self.config.trainer.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
-        )
+        )  # 初始化 RolloutTraceConfig
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
-        """Generate sequences from agent loop.
+        """通过 agent loop 生成序列。
 
-        Args:
-            batch (DataProto): Input batch.
+        参数:
+            batch (DataProto): 输入批次
 
-        Returns:
-            DataProto: Output batch.
-            - prompts: [bsz, prompt_length], prompt token ids from dataset.
-            - responses: [bsz, response_length], output token ids include response tokens
-              from LLM generation and observation tokens from tool_calls.
-            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
-            - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
-              and response tokens.
-            - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
-            - position_ids: [bsz, prompt_length + response_length], incremental position ids.
-
-            For multi-turn conversations:
-            responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
-            response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
+        返回:
+            DataProto: 输出批次，包含生成的序列和其他信息
         """
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
@@ -364,14 +355,14 @@ class AgentLoopWorker:
             top_p=config.top_p,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
-        )
+        )  # 采样参数
 
-        # override sampling params for validation
+        # 验证时覆盖采样参数
         if batch.meta_info.get("validate", False):
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
 
-        # by default, we assume it's a single turn agent
+        # 默认认为是单轮对话 agent
         if "agent_name" not in batch.non_tensor_batch:
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
 
@@ -382,15 +373,16 @@ class AgentLoopWorker:
 
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
-        )
+        )  # 获取轨迹信息
 
         tasks = []
         for i in range(len(batch)):
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            # 为每个样本创建异步任务
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
-        outputs = await asyncio.gather(*tasks)
+        outputs = await asyncio.gather(*tasks)  # 等待所有任务完成
 
-        output = self._postprocess(outputs)
+        output = self._postprocess(outputs)  # 后处理
         return output
 
     async def _run_agent_loop(
@@ -401,6 +393,17 @@ class AgentLoopWorker:
         agent_name: str,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
+        """运行单个 agent loop。
+
+        参数:
+            sampling_params (Dict[str, Any]): LLM 采样参数
+            trajectory (Dict[str, Any]): 轨迹信息
+            agent_name (str): agent 名称
+            **kwargs: 其他参数
+
+        返回:
+            _InternalAgentLoopOutput: 内部输出，包括填充后的序列和其他信息
+        """
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -419,28 +422,29 @@ class AgentLoopWorker:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
-            )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            )  # 实例化 agent loop
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)  # 运行 agent loop
 
-            # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
+            # 有些 AgentLoop 可能已经计算了奖励分数，例如 SWE-agent。
             if output.reward_score is None and not self.config.reward_model.enable:
+                # 如果奖励分数未计算且奖励模型未启用，使用奖励管理器计算分数
                 output.reward_score = await self.reward_manager_worker.compute_score.remote(output, kwargs)
 
-            # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
-            # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
-            # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
-            # input_ids: concatenation of prompt + response
+            # NOTE: 与 vllm_rollout_spmd.py 中的 generate_sequences 批处理版本保持一致
+            # prompt_ids: 左侧用零填充 (e.g., [0,0,0,0,1,2,3,4])
+            # response_ids: 右侧用零填充 (e.g., [5,6,7,8,0,0,0,0])
+            # input_ids: prompt + response 的连接
             # Mask:
-            # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
-            # - prompt_attention_mask: 0s for padding, 1s for tokens
+            # 例如，如果提示是 [1,2,3,4] 而响应是 [5,6,7,(tool start)8,9(tool end),10,11,12]
+            # - prompt_attention_mask: 填充为 0，真实 token 为 1
             #   e.g., [0,0,0,0,1,1,1,1]
-            # - response_attention_mask: 0s for padding, 1s for tokens
+            # - response_attention_mask: 填充为 0，真实 token 为 1
             #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
-            # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
+            # attention_mask: prompt 和 response attention_mask 的连接
             #   e.g., [0,0,0,0,1,1,1,1(prompt),1,1,1,1,1,1,1,1,1,1,1,0,0,0,0(response)]
-            # - response_mask: 1s for LLM generated tokens, 0 for tool response/padding tokens
+            # - response_mask: LLM 生成的 token 为 1，工具响应/填充 token 为 0
             #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
-            # - position_ids: sequential positions for tokens, starting at 0
+            # - position_ids: 真实 token 的顺序位置，从 0 开始
             #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
             self.tokenizer.padding_side = "left"
@@ -450,7 +454,7 @@ class AgentLoopWorker:
                 max_length=self.config.actor_rollout_ref.rollout.prompt_length,
                 return_tensors="pt",
                 return_attention_mask=True,
-            )
+            )  # 填充 prompt_ids
             if prompt_output["input_ids"].dim() == 1:
                 prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
                 prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
@@ -462,7 +466,7 @@ class AgentLoopWorker:
                 max_length=self.config.actor_rollout_ref.rollout.response_length,
                 return_tensors="pt",
                 return_attention_mask=True,
-            )
+            )  # 填充 response_ids
             if response_output["input_ids"].dim() == 1:
                 response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
                 response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
@@ -473,7 +477,7 @@ class AgentLoopWorker:
                 max_length=self.config.actor_rollout_ref.rollout.response_length,
                 return_tensors="pt",
                 return_attention_mask=False,
-            )
+            )  # 填充 response_mask
             if response_mask_output["input_ids"].dim() == 1:
                 response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
@@ -486,9 +490,9 @@ class AgentLoopWorker:
             attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
             input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
-            # Handle multi-modal inputs and position_ids calculation
-            # Only support Qwen2VLImageProcessor for multi-modal processing currently
-            # TODO: support other multi-modal inputs
+            # 处理多模态输入和 position_ids 计算
+            # 目前仅支持 Qwen2VLImageProcessor 进行多模态处理
+            # TODO: 支持其他多模态输入
             multi_modal_inputs = None
             if (
                 self.processor is not None
@@ -537,8 +541,8 @@ class AgentLoopWorker:
             )
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
-        """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        # Convert lists back to tensors and stack them to create a batch.
+        """处理来自 _run_agent_loop 的填充输出，并将它们合并为一个批次。"""
+        # 将列表转换回张量并堆叠以创建一个批次。
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
         response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
@@ -575,7 +579,7 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
 
-        # Add multi_modal_inputs to non_tensor_batch if any samples have them
+        # 如果有样本包含多模态输入，则将 multi_modal_inputs 添加到 non_tensor_batch
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
@@ -585,15 +589,15 @@ class AgentLoopWorker:
 
 
 async def get_trajectory_info(step, index, validate):
-    """Get trajectory info.
+    """获取轨迹信息。
 
-    Args:
-        step (int): global steps in the trainer.
-        index (list): form datastore extra_info.index column.
-        validate (bool): whether is a validate step.
+    参数:
+        step (int): 全局步骤
+        index (list): 数据存储索引
+        validate (bool): 是否为验证步骤
 
-    Returns:
-        list: trajectory.
+    返回:
+        list: 轨迹信息
     """
     trajectory_info = []
     rollout_n = 0
@@ -607,39 +611,50 @@ async def get_trajectory_info(step, index, validate):
 
 
 class AgentLoopManager:
-    """Agent loop manager that manages a group of agent loop workers."""
+    """
+    Agent loop 管理器，管理一组 agent loop 工作线程。
+    主要功能：
+    - 初始化和管理分布式 LLM 服务器
+    - 初始化和分配 agent loop worker
+    - 批量分发推理任务，收集和合并结果
+    - 统计性能指标，支持唤醒/休眠服务器
+    """
 
     def __init__(self, config: DictConfig, worker_group: RayWorkerGroup):
-        """Initialize agent loop manager.
-
-        Args:
-            config (DictConfig): trainer config.
-            worker_group (RayWorkerGroup): ActorRolloutRef worker group.
         """
-        self.config = config
-        self.worker_group = worker_group
+        初始化 agent loop 管理器。
+        参数:
+            config (DictConfig): 训练器配置
+            worker_group (RayWorkerGroup): ActorRolloutRef 工作组
+        """
+        self.config = config  # 保存配置
+        self.worker_group = worker_group  # 保存工作组
 
-        self._initialize_llm_servers()
-        self._init_agent_loop_workers()
+        self._initialize_llm_servers()  # 初始化 LLM 服务器（分布式推理服务）
+        self._init_agent_loop_workers()  # 初始化 agent loop 工作线程（分布式推理 worker）
 
-        # Initially we're in sleep mode.
-        self.sleep()
+        self.sleep()  # 启动后默认让所有服务器休眠，节省资源
 
     def _initialize_llm_servers(self):
-        self.rollout_tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
-        self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
+        """
+        初始化 LLM 服务器。
+        包括分布式推理的 TP/DP 参数计算、节点分配、服务器实例启动与重试、引擎初始化。
+        """
+        self.rollout_tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size  # 张量并行数
+        self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size  # 数据并行数
 
         workers_info = ray.get(
             [
                 worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
                 for worker in self.worker_group.workers
             ]
-        )
-        assert len(workers_info) == self.worker_group.world_size
+        )  # 获取所有 worker 的 node_id
+        assert len(workers_info) == self.worker_group.world_size  # 校验 worker 数量
 
-        self.async_llm_servers = [None] * self.rollout_dp_size
-        self.server_addresses = [None] * self.rollout_dp_size
+        self.async_llm_servers = [None] * self.rollout_dp_size  # 初始化服务器句柄列表
+        self.server_addresses = [None] * self.rollout_dp_size  # 初始化服务器地址列表
 
+        # 判断是否使用自定义异步服务器类
         if self.config.actor_rollout_ref.rollout.agent.custom_async_server:
             server_class = async_server_class(
                 rollout_backend=self.config.actor_rollout_ref.rollout.name,
@@ -649,42 +664,47 @@ class AgentLoopManager:
         else:
             server_class = async_server_class(rollout_backend=self.config.actor_rollout_ref.rollout.name)
 
-        # Start all server instances, restart if address already in use.
-        unready_dp_ranks = set(range(self.rollout_dp_size))
+        # 启动所有服务器实例，如果地址已被占用则重启。
+        unready_dp_ranks = set(range(self.rollout_dp_size))  # 未就绪的 DP rank 集合
         while len(unready_dp_ranks) > 0:
             servers = {
                 rollout_dp_rank: server_class.options(
-                    # make sure AsyncvLLMServer colocates with its corresponding workers
+                    # 确保 AsyncvLLMServer 与其对应的工作线程共址
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=workers_info[rollout_dp_rank * self.rollout_tp_size],
-                        soft=False,
+                        # 通过 TP/DP 计算，找到该 DP rank 对应的物理节点 id
+                        soft=False,  # 强约束，必须分配到指定节点
                     ),
-                    name=f"async_llm_server_{rollout_dp_rank}",
+                    name=f"async_llm_server_{rollout_dp_rank}",  # 给每个服务器实例命名，方便管理和调试
                 ).remote(self.config, self.rollout_dp_size, rollout_dp_rank, self.worker_group.name_prefix)
-                for rollout_dp_rank in unready_dp_ranks
+                # 启动远程 Ray actor，传递必要参数
+                for rollout_dp_rank in unready_dp_ranks  # 对所有未就绪的 DP rank 批量启动服务器
             }
 
             for rollout_dp_rank, server in servers.items():
                 try:
-                    address = ray.get(server.get_server_address.remote())
-                    self.server_addresses[rollout_dp_rank] = address
-                    self.async_llm_servers[rollout_dp_rank] = server
-                    unready_dp_ranks.remove(rollout_dp_rank)
+                    address = ray.get(server.get_server_address.remote())  # 获取服务器地址
+                    self.server_addresses[rollout_dp_rank] = address  # 保存地址
+                    self.async_llm_servers[rollout_dp_rank] = server  # 保存服务器句柄
+                    unready_dp_ranks.remove(rollout_dp_rank)  # 标记为已就绪
                 except Exception:
-                    ray.kill(server)
+                    ray.kill(server)  # 启动失败则杀死重启
                     print(f"rollout server {rollout_dp_rank} failed, maybe address already in use, restarting...")
 
-        # All server instances are ready, init AsyncLLM engine.
-        ray.get([server.init_engine.remote() for server in self.async_llm_servers])
+        # 所有服务器实例均已准备就绪，初始化 AsyncLLM 引擎。
+        ray.get([server.init_engine.remote() for server in self.async_llm_servers])  # 初始化引擎
 
     def _init_agent_loop_workers(self):
-        self.agent_loop_workers = []
-        num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
+        """
+        初始化 agent loop 工作线程。
+        按 worker 数量轮询分配到所有可用节点，创建 AgentLoopWorker 实例。
+        """
+        self.agent_loop_workers = []  # 工作线程列表
+        num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers  # worker 数量
 
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]  # 获取所有可用节点 id
         for i in range(num_workers):
-            # Round-robin scheduling over the all nodes
-            node_id = node_ids[i % len(node_ids)]
+            node_id = node_ids[i % len(node_ids)]  # 轮询分配节点
             self.agent_loop_workers.append(
                 AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
@@ -692,41 +712,44 @@ class AgentLoopManager:
                         node_id=node_id, soft=True
                     ),
                 ).remote(self.config, self.async_llm_servers)
-            )
+            )  # 创建并启动远程 worker
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """Split input batch and dispatch to agent loop workers.
-
-        Args:
-            prompts (DataProto): Input batch.
-
-        Returns:
-            DataProto: Output batch.
+        """
+        拆分输入批次并分发给 agent loop 工作线程。
+        支持推理前唤醒服务器，推理后休眠服务器，批量收集和合并结果，统计性能指标。
+        参数:
+            prompts (DataProto): 输入批次
+        返回:
+            DataProto: 输出批次
         """
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+            self.wake_up()  # 推理前唤醒服务器
+        chunkes = prompts.chunk(len(self.agent_loop_workers))  # 按 worker 数量拆分输入
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
-        )
-        output = DataProto.concat(outputs)
+        )  # 并发分发到各 worker 并收集结果
+        output = DataProto.concat(outputs)  # 合并所有 worker 的输出
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.sleep()
+            self.sleep()  # 推理后休眠服务器
 
-        # calculate performance metrics
-        metrics = [output.meta_info["metrics"] for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
+        metrics = [output.meta_info["metrics"] for output in outputs]  # 收集所有样本的性能指标
+        timing = self._performance_metrics(metrics, output)  # 统计性能指标
 
-        output.meta_info = {"timing": timing}
-        return output
+        output.meta_info = {"timing": timing}  # 写入 meta_info
+        return output  # 返回最终批次
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
+        """
+        计算性能指标。
+        包括所有样本的生成耗时、工具调用耗时，统计 min/max/mean，记录最慢样本详细信息。
+        """
         timing = {}
-        t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
-        t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
+        t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])  # 生成耗时
+        t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])  # 工具调用耗时
         timing["agent_loop/generate_sequences/min"] = t_generate_sequences.min()
         timing["agent_loop/generate_sequences/max"] = t_generate_sequences.max()
         timing["agent_loop/generate_sequences/mean"] = t_generate_sequences.mean()
@@ -734,8 +757,7 @@ class AgentLoopManager:
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
 
-        # batch sequence generation is bounded by the slowest sample
-        slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        slowest = np.argmax(t_generate_sequences + t_tool_calls)  # 找出最慢样本
         attention_mask = output.batch["attention_mask"][slowest]
         prompt_length = output.batch["prompts"].shape[1]
         timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
@@ -743,12 +765,16 @@ class AgentLoopManager:
         timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
 
-        return timing
+        return timing  # 返回性能统计结果
 
     def wake_up(self):
-        """Wake up all rollout server instances."""
-        ray.get([server.wake_up.remote() for server in self.async_llm_servers])
+        """
+        唤醒所有 rollout 服务器实例。
+        """
+        ray.get([server.wake_up.remote() for server in self.async_llm_servers])  # 批量唤醒
 
     def sleep(self):
-        """Sleep all rollout server instances."""
-        ray.get([server.sleep.remote() for server in self.async_llm_servers])
+        """
+        使所有 rollout 服务器实例休眠。
+        """
+        ray.get([server.sleep.remote() for server in self.async_llm_servers])  # 批量休眠

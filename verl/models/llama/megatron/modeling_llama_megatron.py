@@ -19,21 +19,19 @@
 # limitations under the License.
 """PyTorch LLaMA model with Megatron-style acceleration."""
 
-from typing import Optional
-
-import torch
-import torch.utils.checkpoint
-from megatron.core import ModelParallelConfig, mpu, tensor_parallel
-from torch import nn
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import CausalLMOutputWithPast
-
-from verl.utils.megatron import sequence_parallel as sp_utils
-from verl.utils.megatron import tensor_parallel as tp_utils
-from verl.utils.megatron_utils import TransformerConfig, convert_config
-
-from .layers import ParallelLlamaDecoderLayer, ParallelLlamaDecoderLayerRmPad, ParallelLlamaRMSNorm
+# 导入相关类型和库
+from typing import Optional  # 类型提示，可选参数
+import torch  # PyTorch 主库
+import torch.utils.checkpoint  # 用于梯度检查点，节省显存
+from megatron.core import ModelParallelConfig, mpu, tensor_parallel  # Megatron 并行配置与工具
+from torch import nn  # 神经网络模块
+from transformers.modeling_outputs import BaseModelOutputWithPast  # transformers 输出类型
+from transformers.models.llama.configuration_llama import LlamaConfig  # LLaMA 配置
+from transformers.models.llama.modeling_llama import CausalLMOutputWithPast  # LLaMA 输出类型
+from verl.utils.megatron import sequence_parallel as sp_utils  # Megatron 序列并行工具
+from verl.utils.megatron import tensor_parallel as tp_utils  # Megatron 张量并行工具
+from verl.utils.megatron_utils import TransformerConfig, convert_config  # 转换配置工具
+from .layers import ParallelLlamaDecoderLayer, ParallelLlamaDecoderLayerRmPad, ParallelLlamaRMSNorm  # 并行解码层和归一化层
 
 """
 TODO: 
@@ -42,63 +40,81 @@ TODO:
 3. Load checkpoint from meta LLama pretrained checkpoint
 """
 
-
-# Copied from transformers.models.bart.modeling_bart._make_causal_mask
+# 生成因果掩码（用于自回归注意力机制）
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device):
     """
     Make causal mask used for bi-directional self-attention.
+    输入:
+        input_ids_shape: 输入张量的形状 (batch_size, seq_len)
+        dtype: 数据类型
+        device: 设备
+    输出:
+        mask: 因果掩码，防止模型看到未来信息
     """
     bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
-    mask_cond = torch.arange(mask.size(-1), device=device)
-    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)  # 初始化为最小值
+    mask_cond = torch.arange(mask.size(-1), device=device)  # 序列索引
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)  # 下三角为0
     mask = mask.to(dtype)
-    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len)  # 扩展为 batch 维度
 
-
-# Copied from transformers.models.bart.modeling_bart._expand_mask
+# 扩展注意力掩码到多维（用于多头注意力）
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    输入:
+        mask: 原始掩码 (batch_size, seq_len)
+        dtype: 数据类型
+        tgt_len: 目标序列长度
+    输出:
+        inverted_mask: 扩展后的掩码，适配多头注意力
     """
     bsz, src_len = mask.size()
     tgt_len = tgt_len if tgt_len is not None else src_len
-
     expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
-
     inverted_mask = 1.0 - expanded_mask
-
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
-
+# LLaMA 并行模型定义
 class ParallelLlamaModel(nn.Module):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
-
     Args:
         config: LlamaConfig
+        megatron_config: ModelParallelConfig
     """
-
     def __init__(self, config: LlamaConfig, megatron_config: ModelParallelConfig):
         super().__init__()
+        # 转换配置为 Megatron 格式，便于并行
         self.config: TransformerConfig = convert_config(config, megatron_config)
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-        embedding_kwargs = tp_utils.get_default_kwargs_for_parallel_embedding()
+        self.padding_idx = config.pad_token_id  # 填充 token 索引
+        self.vocab_size = config.vocab_size  # 词表大小
+        embedding_kwargs = tp_utils.get_default_kwargs_for_parallel_embedding()  # 获取并行嵌入参数
         if megatron_config is not None:
             assert embedding_kwargs.get("config", False), "must have ModelParallelConfig"
-            tp_utils.update_kwargs_with_config(embedding_kwargs, self.megatron_config)
+            tp_utils.update_kwargs_with_config(embedding_kwargs, self.megatron_config)  # 更新嵌入参数
+        # 并行词嵌入层
         self.embed_tokens = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, **embedding_kwargs
         )
-
+        # 堆叠多个并行解码层
         self.layers = nn.ModuleList(
             [ParallelLlamaDecoderLayer(config, megatron_config) for _ in range(config.num_hidden_layers)]
         )
+        # 并行归一化层
         self.norm = ParallelLlamaRMSNorm(config, megatron_config)
 
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds):
+        """
+        准备解码器的注意力掩码
+        输入:
+            attention_mask: 原始注意力掩码
+            input_shape: 输入形状
+            inputs_embeds: 输入嵌入
+        输出:
+            combined_attention_mask: 组合后的注意力掩码
+        """
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
@@ -159,6 +175,10 @@ class ParallelLlamaModel(nn.Module):
 
 
 class ParallelLlamaForCausalLM(nn.Module):
+    """
+    LLaMA 语言模型头
+    """
+
     def __init__(self, config: LlamaConfig, megatron_config: ModelParallelConfig):
         super().__init__()
         self.config: TransformerConfig = convert_config(config, megatron_config)
@@ -291,6 +311,10 @@ class ParallelLlamaModelRmPad(nn.Module):
 
 
 class ParallelLlamaForCausalLMRmPad(nn.Module):
+    """
+    LLaMA 语言模型头（去除填充）
+    """
+
     def __init__(self, config: LlamaConfig, megatron_config: ModelParallelConfig):
         super().__init__()
         self.config: TransformerConfig = convert_config(config, megatron_config)
@@ -300,6 +324,9 @@ class ParallelLlamaForCausalLMRmPad(nn.Module):
         self._init_head(config)
 
     def _init_head(self, config):
+        """
+        初始化语言模型头
+        """
         column_kwargs = tp_utils.get_default_kwargs_for_column_parallel_linear()
         if self.megatron_config is not None:
             assert column_kwargs.get("config", False), "must have ModelParallelConfig"
@@ -314,6 +341,9 @@ class ParallelLlamaForCausalLMRmPad(nn.Module):
         )
 
     def _forward_head(self, hidden_states):
+        """
+        前向传播通过语言模型头
+        """
         # all_gather from sequence parallel region is performed inside lm_head
         logits = self.lm_head(hidden_states)[0]
         logits = logits.float()  # (total_nnz_padded, 1, vocab_size // tp)
@@ -383,7 +413,14 @@ class ParallelLlamaForCausalLMRmPad(nn.Module):
 
 
 class ParallelLlamaForValueRmPad(ParallelLlamaForCausalLMRmPad):
+    """
+    LLaMA 值头（去除填充）
+    """
+
     def _init_head(self, config):
+        """
+        初始化值头
+        """
         column_kwargs = tp_utils.get_default_kwargs_for_column_parallel_linear()
         if self.megatron_config is not None:
             assert column_kwargs.get("config", False), "must have ModelParallelConfig"
@@ -393,6 +430,9 @@ class ParallelLlamaForValueRmPad(ParallelLlamaForCausalLMRmPad):
         sp_utils.mark_parameter_as_sequence_parallel(self.lm_head.weight)
 
     def _forward_head(self, hidden_states):
+        """
+        前向传播通过值头
+        """
         logits = self.lm_head(hidden_states)  # (total_nnz_padded // tp, 1, 1)
         logits = logits.float()
         if self.megatron_config.sequence_parallel:
@@ -531,6 +571,10 @@ class ParallelLlamaModelRmPadPP(nn.Module):
 
 
 class ParallelLlamaForCausalLMRmPadPP(nn.Module):
+    """
+    LLaMA 语言模型头（去除填充，支持管道并行）
+    """
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -567,6 +611,9 @@ class ParallelLlamaForCausalLMRmPadPP(nn.Module):
         self.model.set_input_tensor(input_tensor[0])
 
     def _init_head(self, config):
+        """
+        初始化语言模型头
+        """
         column_kwargs = tp_utils.get_default_kwargs_for_column_parallel_linear()
         if self.megatron_config is not None:
             assert column_kwargs.get("config", False), "must have ModelParallelConfig"
@@ -581,6 +628,9 @@ class ParallelLlamaForCausalLMRmPadPP(nn.Module):
         )
 
     def _forward_head(self, hidden_states):
+        """
+        前向传播通过语言模型头
+        """
         # all_gather from sequence parallel region is performed inside lm_head
         # logits shape before forward_head hidden_states.shape: [4, 32, 4096]
         logits = self.lm_head(hidden_states)[0]
@@ -657,7 +707,14 @@ class ParallelLlamaForCausalLMRmPadPP(nn.Module):
 
 
 class ParallelLlamaForValueRmPadPP(ParallelLlamaForCausalLMRmPadPP):
+    """
+    LLaMA 值头（去除填充，支持管道并行）
+    """
+
     def _init_head(self, config):
+        """
+        初始化值头
+        """
         column_kwargs = tp_utils.get_default_kwargs_for_column_parallel_linear()
         if self.megatron_config is not None:
             assert column_kwargs.get("config", False), "must have ModelParallelConfig"
@@ -667,6 +724,9 @@ class ParallelLlamaForValueRmPadPP(ParallelLlamaForCausalLMRmPadPP):
         sp_utils.mark_parameter_as_sequence_parallel(self.lm_head.weight)
 
     def _forward_head(self, hidden_states):
+        """
+        前向传播通过值头
+        """
         logits = self.lm_head(hidden_states)  # (total_nnz_padded // tp, 1, 1)
         logits = logits.float()
         if self.megatron_config.sequence_parallel:

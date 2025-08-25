@@ -1,7 +1,7 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates  # 版权声明，标明归属和年份
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# Licensed under the Apache License, Version 2.0 (the "License");  # 采用 Apache 2.0 开源协议
+# you may not use this file except in compliance with the License.  # 使用需遵守协议条款
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -12,82 +12,82 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-A lightweight one-file FSDP SFT Trainer
+A lightweight one-file FSDP SFT Trainer  # 文件功能说明：轻量级 FSDP SFT 训练器
 TODO(zhangchi.usc1992)
-- Add calculation of mfu
-- Add validation
+- Add calculation of mfu  # 待实现：mfu 计算
+- Add validation  # 待实现：验证功能
 """
 
-import os
+import os  # 导入 os 用于环境变量和文件操作
 
-os.environ["NCCL_DEBUG"] = "WARN"
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ["NCCL_DEBUG"] = "WARN"  # 设置 NCCL 调试级别为 WARN，减少分布式训练时的日志噪音
+os.environ["TOKENIZERS_PARALLELISM"] = "true"  # 允许 tokenizer 并行处理，加速分词
 
-import logging
-import re
-import time
-from contextlib import nullcontext
+import logging  # 日志模块
+import re  # 正则表达式，用于字符串处理
+import time  # 时间相关操作
+from contextlib import nullcontext  # 空上下文管理器，用于兼容 context 场景
 
-import hydra
-import torch
-import torch.distributed
-from omegaconf import DictConfig, OmegaConf
-from peft import LoraConfig, TaskType, get_peft_model
-from tensordict import TensorDict
-from torch import nn, optim
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.utils.data import Dataset, DistributedSampler
-from torchdata.stateful_dataloader import StatefulDataLoader
-from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+import hydra  # 配置管理工具，支持动态参数注入
+import torch  # PyTorch 主库
+import torch.distributed  # 分布式训练相关
+from omegaconf import DictConfig, OmegaConf  # 配置对象，支持 yaml 配置
+from peft import LoraConfig, TaskType, get_peft_model  # PEFT 微调相关，LoRA 配置
+from tensordict import TensorDict  # 张量字典，便于批量数据管理
+from torch import nn, optim  # 神经网络和优化器
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh  # 设备网格，用于分布式设备管理
+from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy  # FSDP 相关配置
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # FSDP 主类
+from torch.utils.data import Dataset, DistributedSampler  # 数据集与分布式采样器
+from torchdata.stateful_dataloader import StatefulDataLoader  # 支持状态保存的数据加载器
+from tqdm import tqdm  # 进度条显示
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel  # Huggingface 模型相关
 
-import verl.utils.hdfs_io as hdfs_io
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
-from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
-from verl.utils.dataset import SFTDataset
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
-from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
-from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group
-from verl.utils.fs import copy_to_local
+import verl.utils.hdfs_io as hdfs_io  # HDFS 文件操作工具
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename  # 检查点管理
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager  # FSDP 检查点管理器
+from verl.utils.dataset import SFTDataset  # 单轮 SFT 数据集
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset  # 多轮 SFT 数据集
+from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available  # 设备相关工具
+from verl.utils.distributed import destroy_global_process_group, initialize_global_process_group  # 分布式进程组管理
+from verl.utils.fs import copy_to_local  # 文件系统工具
 from verl.utils.fsdp_utils import (
-    CPUOffloadPolicy,
-    MixedPrecisionPolicy,
-    apply_fsdp2,
-    fsdp2_clip_grad_norm_,
-    fsdp2_load_full_state_dict,
-    get_fsdp_wrap_policy,
-    get_init_weight_context_manager,
-    init_fn,
+    CPUOffloadPolicy,  # FSDP CPU卸载策略
+    MixedPrecisionPolicy,  # FSDP 混合精度策略
+    apply_fsdp2,  # 应用 FSDP2 包裹
+    fsdp2_clip_grad_norm_,  # FSDP2 梯度裁剪
+    fsdp2_load_full_state_dict,  # 加载完整状态字典
+    get_fsdp_wrap_policy,  # 获取 FSDP 包裹策略
+    get_init_weight_context_manager,  # 获取权重初始化上下文
+    init_fn,  # 初始化函数
 )
-from verl.utils.logger import log_with_rank
-from verl.utils.profiler import log_gpu_memory_usage
-from verl.utils.py_functional import convert_to_regular_types
-from verl.utils.torch_dtypes import PrecisionType
-from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup
-from verl.utils.tracking import Tracking
+from verl.utils.logger import log_with_rank  # 分布式日志工具
+from verl.utils.profiler import log_gpu_memory_usage  # GPU 内存使用分析
+from verl.utils.py_functional import convert_to_regular_types  # 类型转换工具
+from verl.utils.torch_dtypes import PrecisionType  # 精度类型枚举
+from verl.utils.torch_functional import get_cosine_schedule_with_warmup, get_wsd_schedule_with_warmup  # 学习率调度器
+from verl.utils.tracking import Tracking  # 训练过程追踪工具
 from verl.utils.ulysses import (
-    gather_outputs_and_unpad,
-    get_ulysses_sequence_parallel_world_size,
-    ulysses_pad_and_slice_inputs,
+    gather_outputs_and_unpad,  # Ulysses 输出收集与去填充
+    get_ulysses_sequence_parallel_world_size,  # 获取 Ulysses 序列并行世界大小
+    ulysses_pad_and_slice_inputs,  # Ulysses 输入填充与切片
 )
-from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager  # Ulysses 分片管理器
 
-if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-elif is_npu_available:
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+if is_cuda_available:  # 判断是否为 CUDA 环境
+    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input  # CUDA 下的高效注意力填充工具
+elif is_npu_available:  # 判断是否为 NPU 环境
+    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input  # NPU 下的高效注意力填充工具
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
+logger = logging.getLogger(__file__)  # 获取当前文件的 logger
+logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))  # 设置日志级别，默认 WARN
 
 
-def extract_step(path):
-    match = re.search(r"global_step_(\d+)", path)
+def extract_step(path):  # 工具函数：从路径中提取训练步数
+    match = re.search(r"global_step_(\d+)", path)  # 匹配 global_step_数字
     if match:
-        return int(match.group(1))
-    return None
+        return int(match.group(1))  # 返回步数
+    return None  # 未匹配返回 None
 
 
 class FSDPSFTTrainer:
@@ -100,11 +100,11 @@ class FSDPSFTTrainer:
         train_dataset: Dataset,
         val_dataset: Dataset,
     ):
-        self.config = config
-        self.device_mesh = device_mesh
-        self.ulysses_device_mesh = ulysses_device_mesh
-        self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-        self.tokenizer = tokenizer
+        self.config = config  # 保存配置
+        self.device_mesh = device_mesh  # 设备网格
+        self.ulysses_device_mesh = ulysses_device_mesh  # Ulysses 设备网格
+        self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)  # 分片管理器
+        self.tokenizer = tokenizer  # 分词器
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
@@ -118,22 +118,22 @@ class FSDPSFTTrainer:
             print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
             print(f"Using remove padding: {self.use_remove_padding}")
 
-        self._build_dataloader(train_dataset, val_dataset)
+        self._build_dataloader(train_dataset, val_dataset)  # 构建数据加载器
 
         # Initialize resume-related variables
         self.resume_global_step = 0
 
         # build model
-        self._build_model_optimizer()
+        self._build_model_optimizer()  # 构建模型和优化器
 
         # Initialize checkpoint manager
-        self._init_checkpoint_manager()
+        self._init_checkpoint_manager()  # 初始化检查点管理器
 
-        self.load_checkpoint()
+        self.load_checkpoint()  # 加载检查点
 
         if self.device_mesh.get_rank() == 0:
             print(self.config)
-        self.device_name = self.config.trainer.device
+        self.device_name = self.config.trainer.device  # 设备名称
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -144,7 +144,7 @@ class FSDPSFTTrainer:
             f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_size}"
         )
 
-        self.config.data.train_batch_size //= dp_size
+        self.config.data.train_batch_size //= dp_size  # 全局批次大小归一化
 
         assert self.config.data.train_batch_size % self.config.data.micro_batch_size_per_gpu == 0
 
@@ -202,21 +202,21 @@ class FSDPSFTTrainer:
         # TODO (zhangchi.usc1992):
         # 1. support pretrain from random weights
         # 2. support init directly from sharded weights
-        local_model_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
+        local_model_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)  # 复制模型文件到本地
 
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
             import importlib
 
-            importlib.import_module(self.config.model.external_lib)
+            importlib.import_module(self.config.model.external_lib)  # 导入外部库
 
-        log_gpu_memory_usage("Before model allocation", logger=logger)
+        log_gpu_memory_usage("Before model allocation", logger=logger)  # 记录模型分配前的 GPU 内存使用情况
 
-        trust_remote_code = self.config.model.trust_remote_code
-        torch_dtype = self.config.model.fsdp_config.get("model_dtype", "fp32")
-        torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        trust_remote_code = self.config.model.trust_remote_code  # 是否信任远程代码
+        torch_dtype = self.config.model.fsdp_config.get("model_dtype", "fp32")  # 模型数据类型
+        torch_dtype = PrecisionType.to_dtype(torch_dtype)  # 转换为 PyTorch 数据类型
         # load config first
-        config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=trust_remote_code)
+        config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=trust_remote_code)  # 加载模型配置
         self.model_config = config
         if hasattr(self.model_config, "max_position_embeddings"):
             self.model_config.max_position_embeddings = max(
@@ -266,11 +266,11 @@ class FSDPSFTTrainer:
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-        log_gpu_memory_usage("After model allocation", logger=logger)
+        log_gpu_memory_usage("After model allocation", logger=logger)  # 记录模型分配后的 GPU 内存使用情况
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32
-        )
+        )  # 混合精度配置
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
@@ -283,7 +283,7 @@ class FSDPSFTTrainer:
         if not self.config.model.fsdp_config.cpu_offload:
             cpu_offload = None
         else:
-            cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
+            cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)  # CPU 卸载配置
 
         fsdp_strategy = self.config.model.strategy
         if fsdp_strategy == "fsdp":
@@ -319,19 +319,19 @@ class FSDPSFTTrainer:
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
-        log_gpu_memory_usage("After FSDP wrapping", logger=logger)
+        log_gpu_memory_usage("After FSDP wrapping", logger=logger)  # 记录 FSDP 包裹后的 GPU 内存使用情况
 
         self.optimizer = optim.AdamW(
             self.fsdp_model.parameters(),
             lr=self.config.optim.lr,
             betas=self.config.optim.betas,
             weight_decay=self.config.optim.weight_decay,
-        )
+        )  # AdamW 优化器
 
-        log_gpu_memory_usage("After initialize optimizer", logger=logger)
+        log_gpu_memory_usage("After initialize optimizer", logger=logger)  # 记录优化器初始化后的 GPU 内存使用情况
 
-        self.steps_per_epoch = len(self.train_dataloader)
-        self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+        self.steps_per_epoch = len(self.train_dataloader)  # 每个 epoch 的步骤数
+        self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs  # 总步骤数
 
         if self.device_mesh.get_rank() == 0:
             print(
@@ -339,16 +339,16 @@ class FSDPSFTTrainer:
                 f"{self.config.trainer.total_epochs}, total number of steps {self.total_steps}"
             )
 
-        num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)
+        num_warmup_steps = int(self.total_steps * self.config.optim.warmup_steps_ratio)  # 预热步骤数
 
         if not hasattr(self.config.optim, "lr_scheduler") or self.config.optim.lr_scheduler == "cosine":
             self.lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-            )
+            )  # 余弦退火学习率调度器
         elif self.config.optim.lr_scheduler == "wsd":
             self.lr_scheduler = get_wsd_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-            )
+            )  # WSD 学习率调度器
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 

@@ -19,42 +19,42 @@ This is especially useful in settings where proposer model generates new tasks b
 on rollout data.
 """
 
-import logging
-from abc import ABC, abstractmethod
-from typing import Optional
+import logging  # 日志模块
+from abc import ABC, abstractmethod  # 抽象基类和抽象方法
+from typing import Optional  # 类型注解
 
-import datasets
-from omegaconf import DictConfig
-from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizer, ProcessorMixin
+import datasets  # HuggingFace datasets 库
+from omegaconf import DictConfig  # 配置管理库
+from torch.utils.data import Dataset  # PyTorch 数据集基类
+from transformers import PreTrainedTokenizer, ProcessorMixin  # 分词器和处理器基类
 
-from verl import DataProto
-from verl.utils.dataset import RLHFDataset
-from verl.utils.import_utils import load_extern_type
+from verl import DataProto  # verl 数据协议
+from verl.utils.dataset import RLHFDataset  # RLHF 数据集基类
+from verl.utils.import_utils import load_extern_type  # 动态加载外部类型工具
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # 获取当前模块日志记录器
 
 
 class AbstractDataGenerator(ABC):
     def __init__(self, config: DictConfig):
-        self.config = config
+        self.config = config  # 保存配置
 
     @abstractmethod
     def generate(self, dataset: Dataset) -> datasets.Dataset:
         """
-        Generate method must be implemented by subclasses.
-        Args:
-            dataset: The dataset to generate from.
-        Returns:
-            Processed data or result as implemented by the subclass.
+        子类必须实现 generate 方法。
+        参数:
+            dataset: 用于生成新数据的数据集。
+        返回:
+            由子类实现的处理结果。
         """
-        pass
+        pass  # 抽象方法，无实现
 
 
 class MockDataGenerator(AbstractDataGenerator):
     """
-    A noop data gen class that only reappends the first datapoint.
-    This class is useful as a placeholder and testing.
+    一个无操作的数据生成器，仅重新添加第一个数据点。
+    适用于占位和测试。
     """
 
     def __init__(self, config: DictConfig = None):
@@ -62,31 +62,31 @@ class MockDataGenerator(AbstractDataGenerator):
 
     def generate(self, dataset: Dataset) -> datasets.Dataset:
         print("MockDataGenerator: No operation performed on the dataset.")
-        return dataset.dataframe.select([0])
+        return dataset.dataframe.select([0])  # 仅返回第一个数据点
 
 
 class DynamicGenDataset(RLHFDataset):
     """
-    A dataset class that uses a data generation strategy to process data.
-    This class extends RLHFDataset and uses an AbstractDataGen instance to generate data.
+    使用数据生成策略处理数据的数据集类。
+    继承 RLHFDataset，使用 AbstractDataGen 实例生成数据。
     """
 
     def __init__(
         self,
-        data_files: str | list[str],
-        tokenizer: PreTrainedTokenizer,
-        config: DictConfig,
-        processor: Optional[ProcessorMixin] = None,
+        data_files: str | list[str],  # 数据文件路径或列表
+        tokenizer: PreTrainedTokenizer,  # 分词器
+        config: DictConfig,  # 配置
+        processor: Optional[ProcessorMixin] = None,  # 可选处理器
     ):
-        super().__init__(data_files, tokenizer, config, processor)
-        self.datagen: AbstractDataGenerator = config.datagen
+        super().__init__(data_files, tokenizer, config, processor)  # 初始化父类
+        self.datagen: AbstractDataGenerator = config.datagen  # 数据生成器配置
         assert "datagen" in config and config.datagen.get("path", None) is not None, (
             f"datagen path is not set in config: {config}"
-        )
-        # Dynamically load the custom datagen class
+        )  # 检查 datagen 路径
+        # 动态加载自定义数据生成器类
         datagen_cls = load_extern_type(config.datagen.path, config.datagen.name)
 
-        # Verify that the custom datagen class inherits from AbstractDataGenerator
+        # 校验自定义数据生成器类是否继承 AbstractDataGenerator
         abs_cls = AbstractDataGenerator
         if not issubclass(datagen_cls, abs_cls):
             raise TypeError(
@@ -94,19 +94,19 @@ class DynamicGenDataset(RLHFDataset):
                 + " must inherit from {abs_cls}"
             )
 
-        self.data_generator = datagen_cls(config.datagen)
-        self.on_batch_end()
+        self.data_generator = datagen_cls(config.datagen)  # 实例化数据生成器
+        self.on_batch_end()  # 初始化时生成一次数据
 
     def append_dataframe(self, new_dataframe: datasets.Dataset):
-        new_dataframe = self.maybe_filter_out_long_prompts(new_dataframe)
-        self.dataframe = datasets.concatenate_datasets([self.dataframe, new_dataframe])
+        new_dataframe = self.maybe_filter_out_long_prompts(new_dataframe)  # 过滤过长的 prompt
+        self.dataframe = datasets.concatenate_datasets([self.dataframe, new_dataframe])  # 合并数据集
 
-        logger.info(f"new dataset len: {len(self.dataframe)}")
+        logger.info(f"new dataset len: {len(self.dataframe)}")  # 打印新数据集长度
 
     def on_batch_end(self, batch: DataProto) -> None:
         """
-        Generate data using the provided data generation strategy.
-        Note: This method is intended to change the dataset after each training batch.
+        使用数据生成策略生成新数据。
+        注意：该方法用于每个训练 batch 结束后动态改变数据集。
         """
-        new_data = self.data_generator.generate(self)
-        self.append_dataframe(new_data)
+        new_data = self.data_generator.generate(self)  # 生成新数据
+        self.append_dataframe(new_data)  # 添加到数据集

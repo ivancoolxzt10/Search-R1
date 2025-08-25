@@ -13,31 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
+# mcore loader.py 主要用于分布式训练环境下的模型参数加载和层映射。
+# 包含层映射计算、参数广播、分布式 rank 计算等，注释详细解释每个步骤的作用。
 
-import torch
-import torch.distributed as dist
-
-from verl.utils.device import get_device_id, get_torch_device
-
-from .saver import _megatron_calc_global_rank
+import time  # 用于计时分析性能
+import torch  # PyTorch 深度学习框架
+import torch.distributed as dist  # 分布式训练相关模块
+from verl.utils.device import get_device_id, get_torch_device  # 设备相关工具函数
+from .saver import _megatron_calc_global_rank  # 导入全局 rank 计算函数
 
 
 def _megatron_calc_layer_map(config):
-    """Calculate the mapping of global layer_idx to local layer_idx
-    Returns:
-        layer_map (Dict: int -> tuple(int, int, int)):
-            mapping from the global layer index to
-            a tuple of (pp_rank, virtual_pp_rank, layer_idx inside model)
     """
-    from megatron.core import mpu
+    计算全局层索引到本地层索引的映射。
+    参数:
+        config: 包含模型层数等配置参数
+    返回:
+        layer_map (Dict[int, tuple(int, int, int)]):
+            映射全局层索引到 (pp_rank, virtual_pp_rank, 层索引)
+    """
+    from megatron.core import mpu  # Megatron 并行工具
 
-    pp_size = mpu.get_pipeline_model_parallel_world_size()
-    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+    pp_size = mpu.get_pipeline_model_parallel_world_size()  # 管道并行规模
+    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1  # 虚拟管道并行规模
 
     layer_map = dict()
-    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
-    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers
+    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size  # 每个模型的层数
+    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers  # 校验层数一致
 
     for pp_rank_idx in range(pp_size):
         for virtual_pp_rank_idx in range(virtual_pp_size):
@@ -50,54 +52,64 @@ def _megatron_calc_layer_map(config):
                     virtual_pp_rank_idx,
                     layer_idx,
                 )
-    return layer_map
+    return layer_map  # 返回层映射
 
 
 def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, params_dtype, is_value_model=False):
-    """Load merged state_dict to sharded Megatron module in training."""
+    """
+    将合并后的 state_dict 加载到分布式 Megatron GPT 模型。
+    参数:
+        state_dict: 合并后的参数字典
+        wrapped_models: 分布式包装的模型列表
+        config: 模型配置
+        params_dtype: 参数数据类型
+        is_value_model: 是否为 value model
+    """
     from megatron.core import DistributedDataParallel as LocalDDP
     from megatron.core import mpu
     from megatron.core.transformer.module import Float16Module
     from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-    from verl.utils.logger import print_rank_0
-    from verl.utils.megatron_utils import unwrap_model
+    from verl.utils.logger import print_rank_0  # 日志工具
+    from verl.utils.megatron_utils import unwrap_model  # 解包工具
 
-    start_time = time.time()
+    start_time = time.time()  # 记录加载开始时间
 
     def _get_gpt_model(model):
-        return model
+        return model  # 获取 GPT 模型本体
 
     def broadcast_params(module):
+        # 广播参数到所有分布式节点
         for param in module.parameters():
             torch.distributed.broadcast(
                 param.data, src=mpu.get_data_parallel_src_rank(), group=mpu.get_data_parallel_group()
             )
 
-    dp_rank = mpu.get_data_parallel_rank()
-    pp_rank = mpu.get_pipeline_model_parallel_rank()
-    cp_rank = mpu.get_context_parallel_rank()
-    src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=cp_rank)
-    pp_size = mpu.get_pipeline_model_parallel_world_size()
-    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
-    mp_group = mpu.get_model_parallel_group()
+    dp_rank = mpu.get_data_parallel_rank()  # 数据并行 rank
+    pp_rank = mpu.get_pipeline_model_parallel_rank()  # 管道并行 rank
+    cp_rank = mpu.get_context_parallel_rank()  # 上下文并行 rank
+    src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=cp_rank)  # 计算源 rank
+    pp_size = mpu.get_pipeline_model_parallel_world_size()  # 管道并行规模
+    virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1  # 虚拟管道并行规模
+    mp_group = mpu.get_model_parallel_group()  # 模型并行组
 
     if torch.distributed.get_rank() == src_rank:
+        # 校验 rank 是否正确
         assert mp_group.rank() == 0, f"mp_rank:[{mp_group.rank}] != 0 on rank #0"
         assert pp_rank == 0, f"pp_rank:[{pp_rank}] != 0 on rank #0"
         assert dp_rank == 0, f"dp_rank:[{dp_rank}] != 0 on rank #0"
 
     if not isinstance(wrapped_models, list | tuple):
-        wrapped_models = list(wrapped_models)
+        wrapped_models = list(wrapped_models)  # 保证为列表类型
 
-    assert len(wrapped_models) == virtual_pp_size
-    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
-    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers
+    assert len(wrapped_models) == virtual_pp_size  # 校验模型数量
+    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size  # 每个模型的层数
+    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers  # 校验层数一致
 
-    models = [None] * len(wrapped_models)
+    models = [None] * len(wrapped_models)  # 初始化模型列表
 
     for i, wrapped_model in enumerate(wrapped_models):
-        models[i] = unwrap_model(wrapped_model, (torchDDP, LocalDDP, Float16Module))
+        models[i] = unwrap_model(wrapped_model, (torchDDP, LocalDDP, Float16Module))  # 解包模型
         gpt_model_module = _get_gpt_model(models[i])
         assert len(gpt_model_module.decoder.layers) == num_layers_per_model
 
